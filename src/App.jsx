@@ -317,7 +317,7 @@ const DisciplineBanner = ({active,onToggle}) => (
         {active?"🔴 DISCIPLINE MODE ACTIVE":"⚪ Discipline Mode"}
       </span>
       <div style={{fontSize:10,color:C.muted,marginTop:1}}>
-        {active?"Zero tolerance. No excuses. Penalties enforced.":"Tap to activate strict accountability"}
+        {active?"Zero tolerance. No excuses. Shame delivered fresh daily.":"Tap to activate strict accountability"}
       </div>
     </div>
     <div style={{
@@ -339,10 +339,10 @@ const PenaltyAlert = ({level,eaten,goal,discipline}) => {
   if (level===0) return null;
   const msgs = [
     null,
-    "🟡 You're edging over. Stop now and walk it off.",
-    "🟠 You've blown 250+ calories over goal. That's a missed day of deficit.",
-    "🔴 OVER BY 500+ CALORIES. You just erased today's cut. Log it and own it.",
-    "💀 CATASTROPHIC OVERAGE. This is the behavior that keeps you stuck."
+    "🟡 Edging over. Put the fork down. Take a walk. Do not open the fridge again.",
+    "🟠 250+ over goal. That's not a snack, that's a sabotage. Your deficit just waved goodbye.",
+    "🔴 500+ CALORIES OVER. Congratulations, you've officially uncut yourself today. Outstanding work.",
+    "💀 CATASTROPHIC OVERAGE. Whatever you just ate better have been worth the next 3 days of extra cardio. Log it. Own it. Cry about it later."
   ];
   const colors = [null,C.yellow,C.orange,C.red,C.red];
   if (!discipline && level < 3) return null;
@@ -501,11 +501,15 @@ const RecoveryWidget = ({recovery,setRecovery}) => {
 const ShamePanel = ({todayCal,goal,proteinEaten,proteinGoal,walkedToday,workedOut,hydrationPct,discipline}) => {
   if (!discipline) return null;
   const failures = [];
-  if (todayCal > goal+50) failures.push(`🔴 Over calories by ${fmt(todayCal-goal)} kcal — your cut is compromised.`);
-  if (proteinEaten < proteinGoal*0.8 && hour()>18) failures.push(`🔴 Protein only ${fmt(proteinEaten)}/${proteinGoal}g — muscle is being sacrificed.`);
-  if (!walkedToday && hour()>17) failures.push("🔴 Zero steps logged today. No walk = no discipline. Get outside.");
-  if (hydrationPct < 70 && hour()>16) failures.push(`🔴 Only ${Math.round(hydrationPct)}% hydrated. Dehydration kills fat oxidation.`);
-  if (!workedOut && hour()>19) failures.push("⚠️ No workout logged today. Rest days are scheduled — laziness is not.");
+  if (todayCal > goal+50) failures.push(`🔴 ${fmt(todayCal-goal)} calories over goal. Congratulations — you just ate your way back to square one. Your future self is furious.`);
+  if (todayCal > goal+500) failures.push(`☠️ ${fmt(todayCal-goal)} OVER. That's not a cheat meal, that's a war crime against your metabolism. What are you doing?`);
+  if (proteinEaten < proteinGoal*0.8 && hour()>18) failures.push(`🔴 ${fmt(proteinEaten)}g of protein. Your muscles called — they're filing for abandonment. ${proteinGoal}g is the goal, not a suggestion.`);
+  if (proteinEaten < proteinGoal*0.5 && hour()>18) failures.push(`💀 Under half your protein at this hour? You might as well be on a cotton candy diet. Your gains are evaporating in real time.`);
+  if (!walkedToday && hour()>17) failures.push("🔴 Not a single step logged today. A golden retriever has more discipline than you right now. Get. Outside.");
+  if (!walkedToday && hour()>20) failures.push("😂 It's 8pm and you haven't moved. The couch has a permanent impression of your backside. This is not the cut. This is a nap with ambitions.");
+  if (hydrationPct < 70 && hour()>16) failures.push(`🔴 ${Math.round(hydrationPct)}% hydrated. Your kidneys are drafting a resignation letter. Drink water, you dried-out raisin.`);
+  if (hydrationPct < 40 && hour()>16) failures.push(`🌵 ${Math.round(hydrationPct)}% hydrated. A cactus drinks more than you. Your body is attempting to turn into beef jerky.`);
+  if (!workedOut && hour()>19) failures.push("⚠️ No workout today. To be clear: rest days are planned recovery. What you're doing is just avoiding effort and calling it self-care.");
 
   if (failures.length===0) return (
     <Card style={{marginBottom:12,border:`1px solid ${C.success}44`}} glow={C.success}>
@@ -520,7 +524,7 @@ const ShamePanel = ({todayCal,goal,proteinEaten,proteinGoal,walkedToday,workedOu
       {failures.map((f,i)=>(
         <div key={i} style={{fontSize:12,color:C.text,padding:"6px 0",borderBottom:i<failures.length-1?`1px solid ${C.border}`:undefined,lineHeight:1.5}}>{f}</div>
       ))}
-      <div style={{marginTop:10,fontSize:11,color:C.muted}}>You set this standard. Now meet it.</div>
+      <div style={{marginTop:10,fontSize:11,color:C.muted}}>You activated Discipline Mode. You knew what you signed up for. No sympathy. Fix it.</div>
     </Card>
   );
 };
@@ -1384,7 +1388,7 @@ const WorkoutTab = ({workouts,setWorkouts,prs,setPrs,checkins,discipline}) => {
             3+ training days in a row detected. Going heavy today risks injury and stalls recovery.
             Consider: deload session, mobility work, or full rest day.
           </div>
-          {discipline&&<div style={{fontSize:11,color:C.muted,marginTop:6}}>Discipline mode: rest is earned. Forcing a session through high fatigue is not discipline — it's ego.</div>}
+          {discipline&&<div style={{fontSize:11,color:C.muted,marginTop:6}}>Discipline mode note: grinding through severe fatigue isn't toughness — it's how you pull something and spend 3 weeks on the couch. Embarrassing.</div>}
         </Card>
       )}
 
@@ -1889,25 +1893,51 @@ const HealthTab = ({profile,setProfile}) => {
 // DATA TAB
 // ══════════════════════════════════════════════════════════════════════════════
 const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,recovery,prs,onImport}) => {
-  const importRef=useRef();
   const [msg,setMsg]=useState("");
+  const [importing,setImporting]=useState(false);
 
   const exportData=()=>{
     const data={exportedAt:new Date().toISOString(),version:"3.0",profile,foodLog,workouts,walks,checkins,savedMeals,hydration,recovery,prs,
       summary:{foodEntries:foodLog.length,workouts:workouts.length,walks:walks.length,checkins:checkins.length,savedMeals:savedMeals.length,prs:Object.keys(prs).length}
     };
-    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement("a");a.href=url;a.download=`fitcore-v3-${today()}.json`;a.click();URL.revokeObjectURL(url);
+    try {
+      const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;
+      a.download=`fitelations-${today()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },100);
+      setMsg("✅ Export downloaded!");
+      setTimeout(()=>setMsg(""),3000);
+    } catch(e) {
+      setMsg("❌ Export failed: "+e.message);
+    }
   };
 
-  const handleImport=f=>{
-    if(!f)return;
-    const r=new FileReader();
-    r.onload=e=>{
-      try{const d=JSON.parse(e.target.result);if(!d.version)throw new Error();onImport(d);setMsg("✅ Imported successfully!");}
-      catch{setMsg("❌ Invalid FitCore file.");}
-    };r.readAsText(f);
+  const processFile = (file) => {
+    if (!file) return;
+    if (!file.name.endsWith(".json") && file.type !== "application/json") {
+      setMsg("❌ Please select a .json file exported from Fitelations.");
+      return;
+    }
+    setImporting(true);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const d = JSON.parse(text);
+        if (!d.version) throw new Error("Missing version field — not a Fitelations export");
+        onImport(d);
+        setMsg("✅ Imported! " + (d.summary ? `${d.summary.foodEntries||0} meals, ${d.summary.workouts||0} workouts, ${d.summary.checkins||0} check-ins restored.` : "Data restored."));
+      } catch(err) {
+        setMsg("❌ Could not read file: " + err.message + ". Make sure you uploaded a Fitelations export JSON.");
+      }
+      setImporting(false);
+    };
+    reader.onerror = () => { setMsg("❌ File read error. Try again."); setImporting(false); };
+    reader.readAsText(file);
   };
 
   const stats=[
@@ -1925,7 +1955,7 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
         <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:12}}>Data Summary</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
           {stats.map(s=>(
-            <div key={s.l} style={{padding:"10px",background:C.surface,borderRadius:10,border:`1px solid ${C.border}`,textAlign:"center"}}>
+            <div key={s.l} style={{padding:"10px",background:C.surface,borderRadius:10,border:"1px solid "+C.border,textAlign:"center"}}>
               <div style={{fontSize:20,fontWeight:900,color:s.c,fontFamily:"'Space Mono',monospace"}}>{s.v}</div>
               <div style={{fontSize:9,color:C.muted,marginTop:3,textTransform:"uppercase"}}>{s.l}</div>
             </div>
@@ -1933,18 +1963,43 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
         </div>
       </Card>
 
+      {msg&&(
+        <div style={{fontSize:12,padding:"10px 14px",borderRadius:10,marginBottom:12,lineHeight:1.5,
+          background:msg.startsWith("✅")?C.success+"22":C.red+"22",
+          color:msg.startsWith("✅")?C.success:C.red,
+          border:"1px solid "+(msg.startsWith("✅")?C.success+"44":C.red+"44")}}>
+          {msg}
+        </div>
+      )}
+
       <Card style={{marginBottom:12}}>
-        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>Export All Data</div>
-        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Downloads everything as a JSON file. Import it on any device to restore. Save to iCloud or Google Drive weekly.</div>
-        <Btn onClick={exportData} style={{width:"100%"}}>⬇️ Export FitCore v3 Data</Btn>
+        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>⬇️ Export Data</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Downloads all your data as a JSON file. Save it to iCloud or Google Drive as a weekly backup. Import on any device to restore everything.</div>
+        <Btn onClick={exportData} style={{width:"100%"}}>Export Data</Btn>
       </Card>
 
       <Card style={{marginBottom:12}}>
-        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>Import Data</div>
-        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Upload a FitCore export JSON. Data will be merged (no duplicates).</div>
-        {msg&&<div style={{fontSize:12,padding:"7px 10px",borderRadius:8,marginBottom:10,background:msg.startsWith("✅")?C.success+"22":C.red+"22",color:msg.startsWith("✅")?C.success:C.red}}>{msg}</div>}
-        <Btn onClick={()=>importRef.current?.click()} variant="ghost" style={{width:"100%"}}>⬆️ Import JSON File</Btn>
-        <input ref={importRef} type="file" accept=".json,application/json" style={{display:"none"}} onChange={e=>handleImportFile(e.target.files[0])}/>
+        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>⬆️ Import Data</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Select a Fitelations export JSON to restore your data. Existing entries are kept — nothing is overwritten.</div>
+        <label style={{display:"block",width:"100%",boxSizing:"border-box"}}>
+          <div style={{
+            width:"100%",padding:"11px 20px",borderRadius:10,border:"1px solid "+C.accentM,
+            background:"transparent",color:C.accent,fontWeight:700,fontSize:13,
+            cursor:"pointer",textAlign:"center",fontFamily:"inherit",
+            transition:"all 0.2s"
+          }}>
+            {importing ? "⏳ Importing..." : "⬆️ Choose JSON File"}
+          </div>
+          <input
+            type="file"
+            accept=".json,application/json"
+            style={{position:"absolute",left:"-9999px",opacity:0,width:1,height:1}}
+            onChange={e=>{ if(e.target.files[0]) processFile(e.target.files[0]); e.target.value=""; }}
+          />
+        </label>
+        <div style={{fontSize:11,color:C.muted,marginTop:8,textAlign:"center"}}>
+          Tap the button above → select your fitelations-[date].json file
+        </div>
       </Card>
     </div>
   );
@@ -2013,7 +2068,7 @@ const SettingsTab = ({onReplayTutorial}) => {
       <Card style={{marginBottom:12}}>
         <div style={{fontSize:14,fontWeight:700,color:C.text,marginBottom:4}}>AI Provider</div>
         <div style={{fontSize:12,color:C.muted,marginBottom:14,lineHeight:1.5}}>
-          FitCore uses AI for food photo analysis, voice logging, and Cut Coach advice.
+          Fitelations uses AI for food photo analysis, voice logging, and Cut Coach advice.
           Inside Claude.ai, Anthropic works with no key. Self-hosting requires your own key.
         </div>
 
