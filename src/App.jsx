@@ -2,10 +2,10 @@ import { useState, useEffect, useRef } from "react";
 
 // ── Storage ──────────────────────────────────────────────────────────────────
 const KEYS = {
-  profile:"fitel_profile", foodLog:"fitel_food", workouts:"fitel_workouts",
-  walks:"fitel_walks", checkins:"fitel_checkins", savedMeals:"fitel_meals",
-  hydration:"fitel_hydration", recovery:"fitel_recovery", prs:"fitel_prs",
-  discipline:"fitel_discipline"
+  profile:"fc3_profile", foodLog:"fc3_food", workouts:"fc3_workouts",
+  walks:"fc3_walks", checkins:"fc3_checkins", savedMeals:"fc3_meals",
+  hydration:"fc3_hydration", recovery:"fc3_recovery", prs:"fc3_prs",
+  discipline:"fc3_discipline"
 };
 const load = (k,fb) => { try { const r=localStorage.getItem(k); return r?JSON.parse(r):fb; } catch { return fb; } };
 const save = (k,v) => { try { localStorage.setItem(k,JSON.stringify(v)); } catch {} };
@@ -34,6 +34,27 @@ const calcWaterGoalOz = (profile, workedOutToday=false) => {
   const workoutBonus = workedOutToday ? 16 : 0;
   return Math.round(base + workoutBonus);
 };
+
+// Estimate calories burned from a workout entry
+// MET-based: lift=5, cardio=7, outdoor=4, sport=6 · formula: MET × weight(kg) × hours
+const calcWorkoutBurn = (workout, weightLb) => {
+  const kg = (weightLb||250) * 0.453592;
+  const MET = {lift:5, cardio:7, outdoor:4, sport:6};
+  const met = MET[workout.type] || 5;
+  // For lifts, estimate duration from number of sets (avg 3 min/set including rest)
+  let hours;
+  if (workout.type === "lift") {
+    const totalSets = (workout.sets||[]).reduce((a,s)=>a+(parseInt(s.sets)||1),0) || 3;
+    hours = (totalSets * 3) / 60;
+  } else {
+    hours = (parseInt(workout.duration)||30) / 60;
+  }
+  return Math.round(met * kg * hours);
+};
+
+// Total calories burned from workouts on a given date
+const calcDayBurn = (workouts, date, weightLb) =>
+  workouts.filter(w=>w.date===date).reduce((a,w)=>a+calcWorkoutBurn(w,weightLb),0);
 
 const weightTrend = checkins => {
   const pts = checkins.filter(c=>c.weight).slice(-8).map((c,i)=>({x:i,y:parseFloat(c.weight)}));
@@ -66,7 +87,7 @@ const calcFatigue = (workouts, checkins) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // AI PROVIDER LAYER — Anthropic (default) + Gemini 3.1 Flash-Lite / Pro
 // ══════════════════════════════════════════════════════════════════════════════
-const AI_KEY = "fitel_ai_settings";
+const AI_KEY = "fc3_ai_settings";
 const AI_DEFAULTS = { provider:"anthropic", anthropicKey:"", geminiKey:"", geminiModel:"gemini-3.1-flash-lite" };
 const loadAI = () => { try { return {...AI_DEFAULTS,...JSON.parse(localStorage.getItem(AI_KEY)||"{}")}; } catch { return AI_DEFAULTS; } };
 const saveAI = cfg => { try { localStorage.setItem(AI_KEY,JSON.stringify(cfg)); } catch {} };
@@ -122,7 +143,22 @@ const analyzeTranscript = async (transcript) => parseJ(await aiText(
   `User verbally described food eaten. Extract items, calculate full nutrition.\nTranscript: "${transcript}"\nReturn ONLY raw JSON (no markdown):\n{"name":"meal name","calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number,"sugar":number,"sodium":number,"saturated_fat":number,"cholesterol":number,"items":[{"name":"item","qty":"portion","calories":number,"protein":number,"carbs":number,"fat":number}],"notes":"1 sentence"}\nRealistic portions. Vague = standard serving.`, 1200));
 
 const getCutCoach = async (summary) => parseJ(await aiText(
-  `Aggressive fat loss coach. Direct, specific. 3-4 sentences max.\nData: ${JSON.stringify(summary)}\nReturn ONLY JSON: {"verdict":"On Pace|Too Slow|Too Fast|Need Data","advice":"string","adjust_calories":number,"color":"#34d399 or #fbbf24 or #f87171","recovery_note":"1 sentence or empty string"}`, 700));
+  `You are an aggressive but accurate fat loss coach. Analyze the data and respond based on NET calories (eaten minus workout burn).
+Data: ${JSON.stringify(summary)}
+Key rules:
+- todayNetCalories is what matters — NOT gross calories
+- If overGoalToday is true, give a specific recovery plan for the rest of the day (extra cardio, skip next meal, etc.)
+- If avgCalories7d is 0 or very low it means no history yet — say "Need Data" not that they're starving
+- Be direct and specific. 3-4 sentences max.
+Return ONLY raw JSON (no markdown):
+{
+  "verdict": "On Pace|Too Slow|Too Fast|Need Data|Over Goal",
+  "advice": "direct coaching advice string",
+  "adjust_calories": number (negative=cut more, positive=eat more, 0=stay course),
+  "color": "#34d399 or #fbbf24 or #f87171",
+  "recovery_note": "if over goal: specific recovery steps for today, else empty string",
+  "overage_plan": "if overGoalToday: concrete actions like walk X min or skip Y meal to get back on track, else empty string"
+}`, 900));
 
 const analyzeWorkoutTranscript = async (transcript) => parseJ(await aiText(
   `Parse this spoken workout into structured exercise data. Extract every exercise with sets, reps, and weight.
@@ -501,36 +537,73 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
   const proteinGoal=profile.proteinGoal||Math.round((profile.weight||250)*1.1);
   const waterGoal=calcWaterGoalOz(profile,workouts.some(w=>w.date===today()));
 
-  const todayFood=foodLog.filter(e=>e.date===today());
-  const totals=todayFood.reduce((a,e)=>({cal:a.cal+(e.calories||0),pro:a.pro+(e.protein||0)}),{cal:0,pro:0});
-  const todayWater=hydration[today()]||0;
-  const walkedToday=walks.some(w=>w.date===today());
-  const workedOutToday=workouts.some(w=>w.date===today());
+  const todayKey = today();
+  const todayFood = foodLog.filter(e=>e.date===todayKey);
+  const grossCal  = todayFood.reduce((a,e)=>a+(+e.calories||0),0);
+  const todayPro  = todayFood.reduce((a,e)=>a+(+e.protein||0),0);
+  const burnedCal = calcDayBurn(workouts, todayKey, profile.weight);
+  const netCal    = Math.max(0, grossCal - burnedCal);  // net = eaten - burned
+  const totals    = { cal: grossCal, pro: todayPro, net: netCal, burned: burnedCal };
 
-  const penalty=calPenalty(totals.cal,goal);
-  const fatigue=calcFatigue(workouts,checkins);
-  const trend=weightTrend(checkins.slice(-6));
-  const recScore=(recovery[today()])||{};
+  const todayWater    = hydration[todayKey]||0;
+  const walkedToday   = walks.some(w=>w.date===todayKey);
+  const workedOutToday= workouts.some(w=>w.date===todayKey);
 
-  const streak=(() => { let s=0,d=new Date(); while(true){const ds=d.toISOString().slice(0,10);if(foodLog.some(f=>f.date===ds)){s++;d.setDate(d.getDate()-1);}else break;} return s; })();
+  // Penalty is based on NET calories vs goal
+  const penalty = calPenalty(netCal, goal);
+  const fatigue = calcFatigue(workouts, checkins);
+  const trend   = weightTrend(checkins.slice(-6));
 
-  const runCoach=async()=>{
+  const streak = (() => {
+    let s=0, d=new Date();
+    while(true){
+      const ds=d.toISOString().slice(0,10);
+      if(foodLog.some(f=>f.date===ds)){s++;d.setDate(d.getDate()-1);}else break;
+    }
+    return s;
+  })();
+
+  // 7-day averages — only include days that have at least 1 food entry
+  const last14WithFood = foodLog.reduce((acc,f)=>{
+    if(!acc[f.date]) acc[f.date]={cal:0,pro:0};
+    acc[f.date].cal += (+f.calories||0);
+    acc[f.date].pro += (+f.protein||0);
+    return acc;
+  },{});
+  const daysWithFood = Object.values(last14WithFood);
+  const avgCalories  = daysWithFood.length ? Math.round(daysWithFood.reduce((a,d)=>a+d.cal,0)/daysWithFood.length) : 0;
+  const avgProtein   = daysWithFood.length ? Math.round(daysWithFood.reduce((a,d)=>a+d.pro,0)/daysWithFood.length) : 0;
+  const overGoalToday = netCal > goal;
+  const overBy = Math.max(0, netCal - goal);
+
+  const runCoach = async () => {
     setLoadingCoach(true);
     try {
-      const r=await getCutCoach({
-        currentWeight:checkins.at(-1)?.weight,
-        startWeight:checkins[0]?.weight,
-        weeklyTrend:trend?+(trend*4).toFixed(1):null,
-        avgCalories:Math.round(foodLog.slice(-14).reduce((a,f)=>a+f.calories,0)/14),
-        avgProtein:Math.round(foodLog.slice(-7).reduce((a,f)=>a+f.protein,0)/7),
-        calorieGoal:goal, proteinGoal,
-        fatigueScore:+fatigue.toFixed(1),
-        hydrationPct:Math.round((todayWater/waterGoal)*100),
-        recentSleep:checkins.at(-1)?.sleep,
-        streak
+      const r = await getCutCoach({
+        currentWeight:   checkins.at(-1)?.weight   || null,
+        startWeight:     checkins[0]?.weight        || null,
+        weeklyTrend:     trend ? +(trend*4).toFixed(1) : null,
+        todayGrossCalories: grossCal,
+        todayBurnedCalories: burnedCal,
+        todayNetCalories: netCal,
+        todayProtein:    todayPro,
+        avgCalories7d:   avgCalories,
+        avgProtein7d:    avgProtein,
+        calorieGoal:     goal,
+        proteinGoal,
+        overGoalToday,
+        overBy,
+        fatigueScore:    +fatigue.toFixed(1),
+        hydrationPct:    Math.round((todayWater/waterGoal)*100),
+        recentSleep:     checkins.at(-1)?.sleep || null,
+        workedOutToday,
+        walkedToday,
+        streak,
       });
       setCoach(r);
-    } catch { setCoach({verdict:"Error",advice:"AI unavailable.",color:C.muted,recovery_note:""}); }
+    } catch {
+      setCoach({verdict:"Error", advice:"AI unavailable.", color:C.muted, recovery_note:"", overage_plan:""});
+    }
     setLoadingCoach(false);
   };
 
@@ -543,13 +616,13 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
   return (
     <div>
       <ShamePanel
-        todayCal={totals.cal} goal={goal}
-        proteinEaten={totals.pro} proteinGoal={proteinGoal}
+        todayCal={netCal} goal={goal}
+        proteinEaten={todayPro} proteinGoal={proteinGoal}
         walkedToday={walkedToday} workedOut={workedOutToday}
         hydrationPct={hydPct} discipline={discipline}
       />
 
-      <PenaltyAlert level={penalty} eaten={totals.cal} goal={goal} discipline={discipline}/>
+      <PenaltyAlert level={penalty} eaten={netCal} goal={goal} discipline={discipline}/>
 
       {/* Header stats */}
       <Card style={{marginBottom:12}}>
@@ -563,13 +636,14 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
           <Stat label="Fatigue" value={fatigue.toFixed(1)} unit="/10" color={fatigue>=7?C.red:fatigue>=4?C.yellow:C.success} size={18}/>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:12}}>
-          <Stat label="Calories" value={fmt(totals.cal)} color={totals.cal>goal?C.red:C.accent} size={20}/>
-          <Stat label="Protein" value={fmt(totals.pro)} unit="g" color={C.blue} size={20}/>
-          <Stat label="Water" value={Math.round(todayWater)} unit="oz" color={hydPct>=80?C.blue:hydPct>=50?C.yellow:C.red} size={20}/>
-          <Stat label="Water%" value={hydPct} unit="%" color={hydPct>=80?C.success:hydPct>=50?C.yellow:C.red} size={20}/>
+          <Stat label="Eaten" value={fmt(grossCal)} color={C.accent} size={20}/>
+          <Stat label="Burned" value={fmt(burnedCal)} color={C.success} size={20}/>
+          <Stat label="Net Cal" value={fmt(netCal)} color={netCal>goal?C.red:C.accent} size={20}/>
+          <Stat label="Protein" value={fmt(todayPro)} unit="g" color={C.blue} size={20}/>
         </div>
-        <Bar value={totals.cal} max={goal} label="Calories" sub={`${fmt(goal-totals.cal>0?goal-totals.cal:0)} left`} flash={penalty>=2&&discipline}/>
-        <Bar value={totals.pro} max={proteinGoal} color={C.blue} label="Protein" sub={`${fmt(totals.pro)}/${proteinGoal}g`}/>
+        {burnedCal>0&&<div style={{fontSize:11,color:C.success,marginBottom:8}}>💪 Workout burned ~{fmt(burnedCal)} kcal → net {fmt(netCal)} kcal</div>}
+        <Bar value={netCal} max={goal} label="Net Calories" sub={`${fmt(netCal)} eaten − ${fmt(burnedCal)} burned = ${fmt(netCal)} net / ${fmt(goal)} goal`} flash={penalty>=2&&discipline}/>
+        <Bar value={todayPro} max={proteinGoal} color={C.blue} label="Protein" sub={`${fmt(todayPro)}/${proteinGoal}g`}/>
         <Bar value={todayWater} max={waterGoal} color={C.blue} label="Hydration" sub={`${todayWater}/${waterGoal}oz`}/>
       </Card>
 
@@ -588,8 +662,11 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
               <Tag color={coach.color}>{coach.verdict}</Tag>
               {coach.adjust_calories!==0&&<span style={{fontSize:11,color:C.muted}}>Adjust: <span style={{color:coach.adjust_calories>0?C.success:C.red,fontWeight:700}}>{coach.adjust_calories>0?"+":""}{coach.adjust_calories} kcal</span></span>}
             </div>
-            <div style={{fontSize:13,color:C.text,lineHeight:1.65,marginBottom:coach.recovery_note?8:0}}>{coach.advice}</div>
-            {coach.recovery_note&&<div style={{fontSize:11,color:C.muted,fontStyle:"italic"}}>{coach.recovery_note}</div>}
+            <div style={{fontSize:13,color:C.text,lineHeight:1.65,marginBottom:8}}>{coach.advice}</div>
+            {coach.recovery_note&&<div style={{fontSize:12,color:C.yellow,lineHeight:1.5,marginBottom:6,padding:"6px 10px",background:C.yellowD,borderRadius:8}}>{coach.recovery_note}</div>}
+            {coach.overage_plan&&<div style={{fontSize:12,color:C.text,lineHeight:1.5,padding:"8px 10px",background:C.redD,borderRadius:8,border:"1px solid "+C.red+"44"}}>
+              <span style={{color:C.red,fontWeight:700}}>Recovery Plan: </span>{coach.overage_plan}
+            </div>}
           </div>
         )}
       </Card>
@@ -598,10 +675,13 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
       <Card style={{marginBottom:12}}>
         <Sparkline data={weekCals} color={C.accent} h={56} label="7-Day Calories" fillColor={C.accent}/>
         <div style={{borderTop:`1px solid ${C.border}`,marginTop:12,paddingTop:12}}>
-          <div style={{fontSize:10,color:C.muted,marginBottom:3}}>DAILY GOAL LINE</div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:4}}>
+            <span style={{color:C.muted}}>Goal: <span style={{color:C.accent,fontWeight:600}}>{fmt(goal)} kcal</span></span>
+            <span style={{color:C.muted}}>7d avg: <span style={{color:avgCalories>goal?C.red:C.success,fontWeight:600}}>{fmt(avgCalories)} kcal</span></span>
+          </div>
           <div style={{display:"flex",justifyContent:"space-between",fontSize:11}}>
-            <span style={{color:C.muted}}>Goal: {fmt(goal)} kcal</span>
-            <span style={{color:C.muted}}>7d avg: {fmt(weekCals.reduce((a,d)=>a+d.y,0)/7)} kcal</span>
+            <span style={{color:C.muted}}>Today gross: {fmt(grossCal)} kcal</span>
+            <span style={{color:C.success}}>Burned: {fmt(burnedCal)} kcal → Net: {fmt(netCal)}</span>
           </div>
         </div>
       </Card>
@@ -638,74 +718,46 @@ const VoiceLog = ({onLog, onClose}) => {
   useEffect(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { setSupported(false); return; }
-    setSupported(true);
-  }, []);
-
-  const buildRecognizer = () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return null;
     const recog = new SR();
     recog.continuous = true;
     recog.interimResults = true;
     recog.lang = "en-US";
-    recog.maxAlternatives = 1;
-    return recog;
-  };
-
-  const startRecording = async () => {
-    setTranscript(""); setEditTranscript(""); setResult(null); setErrorMsg("");
-    // Request mic permission explicitly first
-    try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch(e) {
-      setErrorMsg("Microphone access denied. Please allow microphone access in your browser settings, then try again.");
-      setPhase("error");
-      return;
-    }
-    const recog = buildRecognizer();
-    if (!recog) { setSupported(false); return; }
     let finalText = "";
-    recog.onresult = e => {
-      finalText = "";
+    recog.onresult = (e) => {
       let interim = "";
+      finalText = "";
       for (let i = 0; i < e.results.length; i++) {
         if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
         else interim += e.results[i][0].transcript;
       }
       setTranscript((finalText + interim).trim());
     };
-    recog.onerror = e => {
-      const errMap = {
-        "not-allowed": "Microphone permission denied. Allow mic access in browser settings.",
-        "no-speech": "No speech detected. Tap stop then try again.",
-        "network": "Network error during recognition. Check your connection.",
-        "aborted": "Recording stopped.",
-      };
-      setErrorMsg(errMap[e.error] || "Mic error: " + e.error + ". Try typing instead.");
-      setPhase("error"); setRecording(false);
+    recog.onerror = (e) => {
+      setErrorMsg("Mic error: " + e.error + ". Try typing instead.");
+      setPhase("error");
+      setRecording(false);
     };
     recog.onend = () => {
       setRecording(false);
-      if (finalText.trim()) { setTranscript(finalText.trim()); setEditTranscript(finalText.trim()); setPhase("review"); }
-      else if (phase === "recording") { setPhase("review"); }
+      if (finalText.trim()) {
+        setTranscript(finalText.trim());
+        setEditTranscript(finalText.trim());
+      }
     };
     recogRef.current = recog;
-    try {
-      recog.start();
-      setRecording(true); setPhase("recording");
-    } catch(e) {
-      setErrorMsg("Could not start recording: " + e.message);
-      setPhase("error");
-    }
+  }, []);
+
+  const startRecording = () => {
+    if (!recogRef.current) return;
+    setTranscript(""); setEditTranscript(""); setResult(null); setErrorMsg("");
+    recogRef.current.start();
+    setRecording(true); setPhase("recording");
   };
 
   const stopRecording = () => {
-    if (recogRef.current) {
-      try { recogRef.current.stop(); } catch(e) {}
-    }
+    recogRef.current?.stop();
     setRecording(false);
-    // onend will fire and set phase to review with the final transcript
-    setTimeout(() => setPhase(p => p === "recording" ? "review" : p), 500);
+    setPhase("review");
   };
 
   const analyze = async (text) => {
@@ -829,23 +881,33 @@ const VoiceLog = ({onLog, onClose}) => {
       {/* Result */}
       {phase==="result" && result && (
         <div style={{animation:"slideIn 0.3s ease"}}>
-          <div style={{fontSize:11,color:C.muted,marginBottom:10}}>✏️ Review &amp; edit before logging</div>
-          <Inp label="Meal Name" value={result.name||""} onChange={e=>setResult(p=>({...p,name:e.target.value}))}/>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
-            <Inp label="Calories" type="number" value={result.calories||""} onChange={e=>setResult(p=>({...p,calories:+e.target.value}))}/>
-            <Inp label="Protein (g)" type="number" value={result.protein||""} onChange={e=>setResult(p=>({...p,protein:+e.target.value}))}/>
-            <Inp label="Carbs (g)" type="number" value={result.carbs||""} onChange={e=>setResult(p=>({...p,carbs:+e.target.value}))}/>
-            <Inp label="Fat (g)" type="number" value={result.fat||""} onChange={e=>setResult(p=>({...p,fat:+e.target.value}))}/>
-            <Inp label="Fiber (g)" type="number" value={result.fiber||""} onChange={e=>setResult(p=>({...p,fiber:+e.target.value}))}/>
-            <Inp label="Sodium (mg)" type="number" value={result.sodium||""} onChange={e=>setResult(p=>({...p,sodium:+e.target.value}))}/>
+          <div style={{fontSize:15,fontWeight:700,color:C.accent,marginBottom:2}}>{result.name}</div>
+          {result.notes && <div style={{fontSize:11,color:C.muted,marginBottom:12}}>{result.notes}</div>}
+
+          {/* Main macros */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:12}}>
+            <Stat label="Cal" value={result.calories} size={18} color={C.accent}/>
+            <Stat label="Protein" value={result.protein} unit="g" size={18} color={C.blue}/>
+            <Stat label="Carbs" value={result.carbs} unit="g" size={18} color={C.yellow}/>
+            <Stat label="Fat" value={result.fat} unit="g" size={18} color={C.purple}/>
+          </div>
+
+          {/* Micronutrients */}
+          <div style={{background:C.surface,borderRadius:10,padding:"10px 13px",marginBottom:12}}>
+            <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:0.8,marginBottom:8}}>Micronutrients</div>
+            <MicroRow label="Fiber" value={result.fiber||0} unit="g" color={C.success}/>
+            <MicroRow label="Sugar" value={result.sugar||0} unit="g" color={C.yellow}/>
+            <MicroRow label="Saturated Fat" value={result.saturated_fat||0} unit="g" color={C.orange}/>
+            <MicroRow label="Cholesterol" value={result.cholesterol||0} unit="mg" color={C.muted}/>
+            <MicroRow label="Sodium" value={result.sodium||0} unit="mg" color={result.sodium>1500?C.red:C.muted}/>
           </div>
 
           {/* Item breakdown */}
           {result.items?.length > 0 && (
-            <div style={{background:C.surface,borderRadius:10,padding:"10px 13px",marginBottom:10}}>
+            <div style={{background:C.surface,borderRadius:10,padding:"10px 13px",marginBottom:12}}>
               <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:0.8,marginBottom:8}}>Item Breakdown</div>
               {result.items.map((item,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:i<result.items.length-1?"1px solid "+C.border:undefined}}>
+                <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:i<result.items.length-1?`1px solid ${C.border}`:undefined}}>
                   <div>
                     <div style={{fontSize:12,color:C.text}}>{item.name}</div>
                     <div style={{fontSize:10,color:C.muted}}>{item.qty}</div>
@@ -859,7 +921,8 @@ const VoiceLog = ({onLog, onClose}) => {
             </div>
           )}
 
-          <div style={{fontSize:10,color:C.muted,fontStyle:"italic",marginBottom:10,padding:"5px 10px",background:C.surface,borderRadius:8}}>
+          {/* Transcript used */}
+          <div style={{fontSize:10,color:C.muted,fontStyle:"italic",marginBottom:12,padding:"6px 10px",background:C.surface,borderRadius:8}}>
             "{editTranscript||transcript}"
           </div>
 
@@ -982,19 +1045,17 @@ const FoodTab = ({profile,foodLog,setFoodLog,savedMeals,setSavedMeals,discipline
 
       {phase==="result"&&result&&(
         <Card style={{marginBottom:12}} glow={C.accent}>
-          <div style={{fontSize:11,color:C.muted,marginBottom:10}}>✏️ Review &amp; edit before logging</div>
-          <Inp label="Meal Name" value={result.name||""} onChange={e=>setResult(p=>({...p,name:e.target.value}))}/>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:4}}>
-            <Inp label="Calories" type="number" value={result.calories||""} onChange={e=>setResult(p=>({...p,calories:+e.target.value}))}/>
-            <Inp label="Protein (g)" type="number" value={result.protein||""} onChange={e=>setResult(p=>({...p,protein:+e.target.value}))}/>
-            <Inp label="Carbs (g)" type="number" value={result.carbs||""} onChange={e=>setResult(p=>({...p,carbs:+e.target.value}))}/>
-            <Inp label="Fat (g)" type="number" value={result.fat||""} onChange={e=>setResult(p=>({...p,fat:+e.target.value}))}/>
-            <Inp label="Fiber (g)" type="number" value={result.fiber||""} onChange={e=>setResult(p=>({...p,fiber:+e.target.value}))}/>
+          <div style={{fontSize:15,fontWeight:700,color:C.accent,marginBottom:3}}>{result.name}</div>
+          {result.notes&&<div style={{fontSize:11,color:C.muted,marginBottom:10}}>{result.notes}</div>}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:12}}>
+            <Stat label="Cal" value={result.calories} size={18}/>
+            <Stat label="Protein" value={result.protein} unit="g" color={C.blue} size={18}/>
+            <Stat label="Carbs" value={result.carbs} unit="g" color={C.yellow} size={18}/>
+            <Stat label="Fat" value={result.fat} unit="g" color={C.purple} size={18}/>
           </div>
-          {result.notes&&<div style={{fontSize:11,color:C.muted,marginBottom:8,fontStyle:"italic"}}>{result.notes}</div>}
-          {discipline&&totals.cal+(result.calories||0)>goal&&(
+          {discipline&&totals.cal+result.calories>goal&&(
             <div style={{fontSize:11,color:C.red,padding:"6px 10px",background:C.redD,borderRadius:8,marginBottom:10}}>
-              ⚠️ This will put you {fmt(totals.cal+(result.calories||0)-goal)} kcal over goal.
+              ⚠️ This meal will put you {fmt(totals.cal+result.calories-goal)} kcal over goal.
             </div>
           )}
           <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -1094,46 +1155,16 @@ const VoiceWorkoutLog = ({onLog, onClose}) => {
     recogRef.current = recog;
   }, []);
 
-  const startRec = async () => {
+  const startRec = () => {
     setTranscript(""); setEditText(""); setResult(null); setErrorMsg("");
-    try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch(e) {
-      setErrorMsg("Microphone access denied. Allow mic access in your browser settings.");
-      setPhase("error"); return;
-    }
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { setSupported(false); return; }
-    const recog = new SR();
-    recog.continuous = true; recog.interimResults = true; recog.lang = "en-US";
-    let finalText = "";
-    recog.onresult = e => {
-      finalText = "";
-      let interim = "";
-      for (let i = 0; i < e.results.length; i++) {
-        if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
-        else interim += e.results[i][0].transcript;
-      }
-      setTranscript((finalText + interim).trim());
-    };
-    recog.onerror = e => {
-      const errMap = {"not-allowed":"Mic permission denied.","no-speech":"No speech detected.","network":"Network error."};
-      setErrorMsg(errMap[e.error]||"Mic error: "+e.error); setPhase("error"); setRecording(false);
-    };
-    recog.onend = () => {
-      setRecording(false);
-      if (finalText.trim()) { setTranscript(finalText.trim()); setEditText(finalText.trim()); }
-      setPhase(p => p === "recording" ? "review" : p);
-    };
-    recogRef.current = recog;
-    try { recog.start(); setRecording(true); setPhase("recording"); }
-    catch(e) { setErrorMsg("Could not start: " + e.message); setPhase("error"); }
+    recogRef.current?.start();
+    setRecording(true); setPhase("recording");
   };
 
   const stopRec = () => {
-    try { recogRef.current?.stop(); } catch(e) {}
+    recogRef.current?.stop();
     setRecording(false);
-    setTimeout(() => setPhase(p => p === "recording" ? "review" : p), 500);
+    setPhase("review");
   };
 
   const analyze = async (text) => {
@@ -1243,21 +1274,25 @@ const VoiceWorkoutLog = ({onLog, onClose}) => {
         </div>
       )}
 
-      {/* Result — editable */}
+      {/* Result */}
       {phase==="result" && result && (
         <div style={{animation:"slideIn 0.3s ease"}}>
-          {result.summary && <div style={{fontSize:12,color:C.muted,marginBottom:10,fontStyle:"italic"}}>{result.summary}</div>}
-          <div style={{fontSize:11,color:C.muted,marginBottom:8}}>✏️ Edit sets, reps or weight before logging</div>
-          {result.exercises.map((ex,i)=>(
-            <div key={i} style={{background:C.surface,borderRadius:10,padding:"10px 12px",marginBottom:8}}>
-              <Inp label="Exercise" value={ex.exercise||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,exercise:e.target.value}:x)}))}/>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
-                <Inp label={"Weight ("+( ex.unit||"lb")+")"} type="number" value={ex.weight||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,weight:e.target.value}:x)}))}/>
-                <Inp label="Reps" type="number" value={ex.reps||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,reps:e.target.value}:x)}))}/>
-                <Inp label="Sets" type="number" value={ex.sets||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,sets:e.target.value}:x)}))}/>
-              </div>
+          {result.summary && <div style={{fontSize:12,color:C.muted,marginBottom:12,fontStyle:"italic"}}>{result.summary}</div>}
+          <div style={{background:C.surface,borderRadius:10,padding:"10px 13px",marginBottom:12}}>
+            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:4,marginBottom:8}}>
+              {["Exercise","Weight","Reps","Sets"].map(h=>(
+                <div key={h} style={{fontSize:9,color:C.muted,textTransform:"uppercase",letterSpacing:0.6}}>{h}</div>
+              ))}
             </div>
-          ))}
+            {result.exercises.map((ex,i)=>(
+              <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:4,padding:"6px 0",borderTop:"1px solid "+C.border}}>
+                <div style={{fontSize:12,fontWeight:600,color:C.accent}}>{ex.exercise}</div>
+                <div style={{fontSize:12,color:C.text}}>{ex.weight}{ex.unit||"lb"}</div>
+                <div style={{fontSize:12,color:C.text}}>{ex.reps}</div>
+                <div style={{fontSize:12,color:C.text}}>{ex.sets}</div>
+              </div>
+            ))}
+          </div>
           <div style={{fontSize:10,color:C.muted,fontStyle:"italic",marginBottom:10,padding:"5px 10px",background:C.surface,borderRadius:8}}>
             "{editText||transcript}"
           </div>
@@ -1863,7 +1898,7 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
     };
     const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
     const url=URL.createObjectURL(blob);
-    const a=document.createElement("a");a.href=url;a.download=`fitelations-v3-${today()}.json`;a.click();URL.revokeObjectURL(url);
+    const a=document.createElement("a");a.href=url;a.download=`fitcore-v3-${today()}.json`;a.click();URL.revokeObjectURL(url);
   };
 
   const handleImport=f=>{
@@ -1871,7 +1906,7 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
     const r=new FileReader();
     r.onload=e=>{
       try{const d=JSON.parse(e.target.result);if(!d.version)throw new Error();onImport(d);setMsg("✅ Imported successfully!");}
-      catch{setMsg("❌ Invalid Fitelations file.");}
+      catch{setMsg("❌ Invalid FitCore file.");}
     };r.readAsText(f);
   };
 
@@ -1899,17 +1934,17 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
       </Card>
 
       <Card style={{marginBottom:12}}>
-        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>Export Data</div>
+        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>Export All Data</div>
         <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Downloads everything as a JSON file. Import it on any device to restore. Save to iCloud or Google Drive weekly.</div>
-        <Btn onClick={exportData} style={{width:"100%"}}>⬇️ Export Data</Btn>
+        <Btn onClick={exportData} style={{width:"100%"}}>⬇️ Export FitCore v3 Data</Btn>
       </Card>
 
       <Card style={{marginBottom:12}}>
         <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>Import Data</div>
-        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Upload a Fitelations export JSON. Data will be merged (no duplicates).</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>Upload a FitCore export JSON. Data will be merged (no duplicates).</div>
         {msg&&<div style={{fontSize:12,padding:"7px 10px",borderRadius:8,marginBottom:10,background:msg.startsWith("✅")?C.success+"22":C.red+"22",color:msg.startsWith("✅")?C.success:C.red}}>{msg}</div>}
         <Btn onClick={()=>importRef.current?.click()} variant="ghost" style={{width:"100%"}}>⬆️ Import JSON File</Btn>
-        <input ref={importRef} type="file" accept=".json,application/json" style={{display:"none"}} onChange={e=>handleImport(e.target.files[0])}/>
+        <input ref={importRef} type="file" accept=".json,application/json" style={{display:"none"}} onChange={e=>handleImportFile(e.target.files[0])}/>
       </Card>
     </div>
   );
@@ -1918,7 +1953,7 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
 // ══════════════════════════════════════════════════════════════════════════════
 // SETTINGS TAB
 // ══════════════════════════════════════════════════════════════════════════════
-const SettingsTab = () => {
+const SettingsTab = ({onReplayTutorial}) => {
   const [cfg, setCfg] = useState(loadAI);
   const [testMsg, setTestMsg] = useState("");
   const [testing, setTesting] = useState(false);
@@ -1978,7 +2013,7 @@ const SettingsTab = () => {
       <Card style={{marginBottom:12}}>
         <div style={{fontSize:14,fontWeight:700,color:C.text,marginBottom:4}}>AI Provider</div>
         <div style={{fontSize:12,color:C.muted,marginBottom:14,lineHeight:1.5}}>
-          Fitelations uses AI for food photo analysis, voice logging, and Cut Coach advice.
+          FitCore uses AI for food photo analysis, voice logging, and Cut Coach advice.
           Inside Claude.ai, Anthropic works with no key. Self-hosting requires your own key.
         </div>
 
@@ -2025,6 +2060,12 @@ const SettingsTab = () => {
           {testMsg.startsWith("C")||testMsg.startsWith("S")?"✅ ":"❌ "}{testMsg}
         </div>
       )}
+
+      <Card style={{marginBottom:12}}>
+        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:6}}>📖 Tutorial</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:12,lineHeight:1.5}}>New to Fitelations or want a refresher? Replay the full feature walkthrough.</div>
+        <Btn onClick={()=>{ if(typeof onReplayTutorial==="function") onReplayTutorial(); }} variant="ghost" style={{width:"100%"}}>📖 Replay Tutorial</Btn>
+      </Card>
 
       <Card>
         <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:10}}>Model Comparison</div>
@@ -2121,11 +2162,106 @@ const SettingsMerged = (props) => {
   return (
     <div>
       <SubNav tabs={subTabs} active={sub} onChange={setSub}/>
-      {sub==="ai"   && <SettingsTab/>}
+      {sub==="ai"   && <SettingsTab onReplayTutorial={props.onReplayTutorial}/>}
       {sub==="data" && <DataTab {...props}/>}
     </div>
   );
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════════════════════════════════════════
+// TUTORIAL SYSTEM
+// ══════════════════════════════════════════════════════════════════════════════
+const TUTORIAL_KEY = "fitel_tutorial_done";
+const TUTORIAL_STEPS = [
+  {id:"welcome",tab:null,icon:"💪",title:"Welcome to Fitelations",body:"Your all-in-one AI-powered fat loss coach. This tutorial walks you through every feature so you hit the ground running. Takes about 3 minutes.",tip:null},
+  {id:"profile",tab:"body",icon:"📊",title:"Step 1 — Set Up Your Profile",body:"Tap Body → Health → Edit and enter your age, height, weight, sex, and activity level. Fitelations uses this to calculate your TDEE, personalized water goal, BMI, and calorie targets.",tip:"💡 Your water goal is 0.5 oz × your bodyweight in pounds. At 328 lb that's ~164 oz/day."},
+  {id:"food_photo",tab:"food",icon:"📷",title:"Step 2 — Log Food by Photo",body:"Tap Food → Camera or Upload. Take a photo of your meal. The AI instantly returns calories, protein, carbs, fat, and fiber. Every value is editable before you log — if the AI is off, just correct it.",tip:"💡 Tap Log & Save to store the meal in your quick-access library for future one-tap logging."},
+  {id:"food_voice",tab:"food",icon:"🎙",title:"Step 3 — Log Food by Voice",body:'Forgot to take a photo? Tap Voice Log and describe your meal: "Two scrambled eggs, a cup of oatmeal with a tablespoon of peanut butter, and a glass of OJ." The AI parses every item and gives a full macro + micronutrient breakdown.',tip:"💡 Edit the transcript before analyzing if it mishears something."},
+  {id:"food_saved",tab:"food",icon:"⭐",title:"Step 4 — Saved Meals",body:'Any meal logged with "Log & Save" appears in your Saved Meals library. Next time you eat the same thing, tap ⭐ and log it in one tap. No re-scanning, no re-typing.',tip:"💡 Build your library over the first week — by day 7 most daily meals will be one tap."},
+  {id:"train_lift",tab:"train",icon:"🏋️",title:"Step 5 — Log Your Lifts",body:"Train tab → + Log to record a session. Enter exercise, weight, reps, and sets. PRs are tracked automatically — every time you hit a new personal best, it's flagged with a 🏆 and saved to your PR board.",tip:"💡 Workout calories are calculated using MET values and subtracted from your net calorie total automatically."},
+  {id:"train_voice",tab:"train",icon:"🎙",title:"Step 6 — Voice Workout Logging",body:'Tap 🎙 Voice in the Train tab and describe your session: "3 sets of 10 reps of 40 pound kettlebell rows, 3 sets of 10 goblet squats at 40 pounds." Every exercise is parsed into a structured, editable log.',tip:"💡 Works great post-workout when your hands are sweaty or you're still catching your breath."},
+  {id:"train_walk",tab:"train",icon:"🗺",title:"Step 7 — GPS Walk Tracker",body:"Train → Walk → Start. Your route is drawn live on a map as you move. Distance, time, and estimated steps are shown in real time. Routes are saved to history with full map replay.",tip:"💡 Keep the screen on while walking. GPS requires HTTPS — works perfectly on your Vercel deployment."},
+  {id:"coach",tab:"coach",icon:"⚡",title:"Step 8 — The Cut Coach",body:"The Coach tab shows net calories (eaten minus workout burn), protein, and hydration at a glance. Tap Analyze for AI advice based on your real trends — weight, 7-day averages, sleep, fatigue, and more.",tip:"💡 If you're over your calorie goal, the Coach gives a specific Recovery Plan — e.g. walk 40 min or skip the evening snack."},
+  {id:"checkin",tab:"coach",icon:"📋",title:"Step 9 — Weekly Check-Ins",body:"Coach → Check-In. Log weight, waist, sleep, hunger, and training performance once a week. This is how the app tracks whether your cut is on pace, too fast, or stalling — and how the Coach improves over time.",tip:"💡 Log your first check-in today with your current weight. It becomes the baseline for everything."},
+  {id:"recovery",tab:"body",icon:"💧",title:"Step 10 — Hydration & Recovery",body:"Body → Recovery. Log water with quick-add buttons (8oz, 16oz, 32oz). Track sleep quality, soreness, stress level, and environment. High fatigue or severe soreness triggers automatic advice to back off or deload.",tip:"💡 Water goal auto-increases by 16oz on workout days. Hot/humid environment adds another prompt."},
+  {id:"discipline",tab:"coach",icon:"🔴",title:"Step 11 — Discipline Mode",body:"Toggle Discipline Mode in the header for zero-tolerance accountability. The app turns red. Alerts fire for: going over net calories, missing protein, skipping walks, and being underhydrated. No excuses.",tip:"💡 Best for hard 4–6 week cut blocks. Turn off on planned rest or refeed days."},
+  {id:"settings",tab:"more",icon:"⚙️",title:"Step 12 — API & Data Settings",body:"Settings → AI: choose Anthropic Claude (works free inside Claude.ai) or Gemini 3.1 Flash-Lite / Pro (free key at aistudio.google.com). Settings → Data: export everything as JSON to back up or move to another device.",tip:"💡 Tap Test Connection after entering your key to confirm it's working before you start logging."},
+  {id:"netcal",tab:"coach",icon:"🧮",title:"How Net Calories Work",body:"Fitelations tracks NET calories: eaten minus workout burn. Eat 2,800 kcal, burn 400 lifting → net is 2,400. Your goal is compared against net. Working out gives you more room to eat without blowing your deficit.",tip:"💡 Burn estimates use MET values: lifting ≈ 5, cardio ≈ 7, outdoor work ≈ 4, sport ≈ 6."},
+  {id:"done",tab:null,icon:"🎉",title:"You're Ready.",body:"That covers everything. Start by setting your profile in Body → Health, log your first meal, then hit your first check-in. The app gets smarter the more you use it. Let's get to work.",tip:null},
+];
+
+const TutorialOverlay = ({onFinish, onSkip, goToTab}) => {
+  const [step, setStep] = useState(0);
+  const cur = TUTORIAL_STEPS[step];
+  const total = TUTORIAL_STEPS.length;
+  const isLast = step === total - 1;
+  const pct = Math.round((step / (total - 1)) * 100);
+
+  const go = (delta) => {
+    const next = step + delta;
+    if (next < 0 || next >= total) return;
+    if (TUTORIAL_STEPS[next].tab) goToTab(TUTORIAL_STEPS[next].tab);
+    setStep(next);
+  };
+
+  useEffect(() => { if (cur.tab) goToTab(cur.tab); }, []);
+
+  return (
+    <div style={{position:"fixed",inset:0,zIndex:9999,background:"rgba(7,9,13,0.88)",backdropFilter:"blur(6px)",display:"flex",alignItems:"flex-end",justifyContent:"center",padding:"0 0 calc(env(safe-area-inset-bottom) + 82px)"}}>
+      <div style={{width:"100%",maxWidth:480,background:C.card,border:"1px solid "+C.border,borderRadius:"20px 20px 0 0",padding:"22px 18px 18px",maxHeight:"68vh",overflowY:"auto",boxShadow:"0 -8px 40px rgba(0,0,0,0.7)"}}>
+        {/* Progress */}
+        <div style={{height:3,background:C.border,borderRadius:99,marginBottom:18,overflow:"hidden"}}>
+          <div style={{width:pct+"%",height:"100%",background:C.accent,borderRadius:99,transition:"width 0.4s cubic-bezier(.4,0,.2,1)"}}/>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <Tag color={C.accent}>{step+1} / {total}</Tag>
+          <button onClick={onSkip} style={{background:"none",border:"1px solid "+C.border,borderRadius:8,color:C.muted,fontSize:11,padding:"4px 12px",cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>Exit Tutorial</button>
+        </div>
+        {/* Icon + title */}
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+          <div style={{width:50,height:50,borderRadius:14,background:C.accentD,border:"1px solid "+C.accentM,display:"flex",alignItems:"center",justifyContent:"center",fontSize:24,flexShrink:0}}>{cur.icon}</div>
+          <div style={{fontSize:16,fontWeight:800,color:C.text,lineHeight:1.3}}>{cur.title}</div>
+        </div>
+        {/* Body */}
+        <div style={{fontSize:13,color:C.text,lineHeight:1.7,marginBottom:cur.tip?12:18}}>{cur.body}</div>
+        {/* Tip */}
+        {cur.tip&&<div style={{fontSize:12,color:C.text,lineHeight:1.6,padding:"9px 13px",background:C.blueD,border:"1px solid "+C.blue+"44",borderRadius:10,marginBottom:18}}>{cur.tip}</div>}
+        {/* Nav buttons */}
+        <div style={{display:"flex",gap:8}}>
+          {step>0&&<Btn onClick={()=>go(-1)} variant="ghost" style={{flex:1}}>← Back</Btn>}
+          {isLast
+            ?<Btn onClick={onFinish} style={{flex:2,padding:"13px"}}>🚀 Let's Go!</Btn>
+            :<Btn onClick={()=>go(1)} style={{flex:step===0?2:1,padding:"13px"}}>{step===0?"Start Tutorial →":"Next →"}</Btn>
+          }
+        </div>
+        {cur.tab&&<div style={{textAlign:"center",marginTop:10,fontSize:10,color:C.muted}}>👆 App behind shows the relevant section</div>}
+      </div>
+    </div>
+  );
+};
+
+const WelcomeScreen = ({onTutorial, onSkip}) => (
+  <div style={{position:"fixed",inset:0,zIndex:9998,background:C.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"'DM Sans','Segoe UI',sans-serif"}}>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,700;9..40,900&family=Space+Mono:wght@700&display=swap" rel="stylesheet"/>
+    <GlobalStyle/>
+    <div style={{width:86,height:86,borderRadius:24,background:C.accentD,border:"2px solid "+C.accentM,display:"flex",alignItems:"center",justifyContent:"center",fontSize:42,marginBottom:22,boxShadow:"0 0 40px "+C.accent+"33"}}>💪</div>
+    <div style={{fontSize:30,fontWeight:900,color:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-1,marginBottom:4}}>FITELATIONS</div>
+    <div style={{fontSize:12,color:C.muted,marginBottom:6,letterSpacing:0.5}}>Fit · Revelation · Results</div>
+    <div style={{fontSize:13,color:C.text,textAlign:"center",lineHeight:1.7,maxWidth:300,marginBottom:32}}>Your AI-powered aggressive fat loss and fitness coach. Track food, workouts, walks, hydration, and recovery — all in one place.</div>
+    <div style={{display:"flex",flexWrap:"wrap",gap:7,justifyContent:"center",marginBottom:36}}>
+      {["📷 AI Food Photo","🎙 Voice Logging","🏆 PR Tracking","💧 Hydration","🗺 GPS Walks","⚡ Cut Coach","🔴 Discipline Mode","💾 Export Data"].map(f=>(
+        <span key={f} style={{background:C.surface,border:"1px solid "+C.border,borderRadius:99,padding:"4px 11px",fontSize:11,color:C.muted,fontWeight:600}}>{f}</span>
+      ))}
+    </div>
+    <div style={{width:"100%",maxWidth:320,display:"flex",flexDirection:"column",gap:10}}>
+      <Btn onClick={onTutorial} style={{width:"100%",padding:"14px",fontSize:14}}>📖 Show Me How It Works</Btn>
+      <Btn onClick={onSkip} variant="ghost" style={{width:"100%",padding:"12px"}}>Skip — Take Me to the App</Btn>
+    </div>
+    <div style={{marginTop:16,fontSize:10,color:C.muted,textAlign:"center"}}>Tutorial takes ~3 min · Replay anytime in Settings</div>
+  </div>
+);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ROOT APP
@@ -2143,6 +2279,12 @@ export default function App() {
   const [prs,setPrs]=useState(()=>load(KEYS.prs,{}));
   const [discipline,setDiscipline]=useState(()=>load(KEYS.discipline,false));
 
+  const [appState,setAppState]=useState(()=>localStorage.getItem(TUTORIAL_KEY)?"app":"welcome");
+
+  const finishTutorial=()=>{ localStorage.setItem(TUTORIAL_KEY,"1"); setAppState("app"); setTab("body"); };
+  const skipTutorial=()=>{ localStorage.setItem(TUTORIAL_KEY,"1"); setAppState("app"); };
+  const replayTutorial=()=>setAppState("tutorial");
+
   const toggleDiscipline=()=>{ const v=!discipline; setDiscipline(v); save(KEYS.discipline,v); };
 
   const handleImport=(d)=>{
@@ -2159,25 +2301,27 @@ export default function App() {
   };
 
   const goal=profile.calorieGoal||calcTDEE(profile)||2200;
-  const todayCal=foodLog.filter(e=>e.date===today()).reduce((a,e)=>a+(e.calories||0),0);
-  const calPct=Math.min(120,Math.round((todayCal/goal)*100));
+  const todayCal=foodLog.filter(e=>e.date===today()).reduce((a,e)=>a+(+e.calories||0),0);
+  const todayBurned=calcDayBurn(workouts,today(),profile.weight);
+  const todayNet=Math.max(0,todayCal-todayBurned);
+  const calPct=Math.min(120,Math.round((todayNet/goal)*100));
   const waterGoal=calcWaterGoalOz(profile,workouts.some(w=>w.date===today()));
   const todayWater=hydration[today()]||0;
   const waterPct=Math.min(100,Math.round((todayWater/waterGoal)*100));
 
   const tabs=[
-    {id:"coach",  icon:"⚡", label:"Coach"},
-    {id:"food",   icon:"🍽", label:"Food"},
-    {id:"train",  icon:"💪", label:"Train"},
-    {id:"body",   icon:"📊", label:"Body"},
-    {id:"more",   icon:"⚙️", label:"Settings"},
+    {id:"coach",icon:"⚡",label:"Coach"},
+    {id:"food",icon:"🍽",label:"Food"},
+    {id:"train",icon:"💪",label:"Train"},
+    {id:"body",icon:"📊",label:"Body"},
+    {id:"more",icon:"⚙️",label:"Settings"},
   ];
 
-  const sharedProps = {
-    profile, setProfile, foodLog, setFoodLog, workouts, setWorkouts,
-    walks, setWalks, checkins, setCheckins, savedMeals, setSavedMeals,
-    hydration, setHydration, recovery, setRecovery, prs, setPrs,
-    discipline, onImport:handleImport
+  const sharedProps={
+    profile,setProfile,foodLog,setFoodLog,workouts,setWorkouts,
+    walks,setWalks,checkins,setCheckins,savedMeals,setSavedMeals,
+    hydration,setHydration,recovery,setRecovery,prs,setPrs,
+    discipline,onImport:handleImport,onReplayTutorial:replayTutorial
   };
 
   return (
@@ -2185,17 +2329,18 @@ export default function App() {
       <GlobalStyle/>
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700;9..40,800;9..40,900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
 
+      {appState==="welcome"&&<WelcomeScreen onTutorial={()=>setAppState("tutorial")} onSkip={skipTutorial}/>}
+      {appState==="tutorial"&&<TutorialOverlay onFinish={finishTutorial} onSkip={skipTutorial} goToTab={setTab}/>}
+
       {/* Header */}
-      <div style={{padding:"14px 16px 12px",position:"sticky",top:0,zIndex:100,background:`${C.bg}f0`,backdropFilter:"blur(20px)",borderBottom:`1px solid ${C.border}`}}>
+      <div style={{padding:"14px 16px 12px",position:"sticky",top:0,zIndex:100,background:`${C.bg}f0`,backdropFilter:"blur(20px)",borderBottom:"1px solid "+C.border}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
           <div>
-            <div style={{fontSize:20,fontWeight:900,color:discipline?C.red:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-0.5,transition:"color 0.3s"}}>
-              FITELATIONS{discipline?" 🔴":""}
-            </div>
+            <div style={{fontSize:20,fontWeight:900,color:discipline?C.red:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-0.5,transition:"color 0.3s"}}>FITELATIONS{discipline?" 🔴":""}</div>
             <div style={{fontSize:9,color:C.muted,letterSpacing:1.5}}>{new Date().toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"}).toUpperCase()}</div>
           </div>
           <div style={{textAlign:"right"}}>
-            <div style={{fontSize:12,fontWeight:700,color:calPct>100?C.red:C.text}}>{fmt(todayCal)}/{fmt(goal)} kcal</div>
+            <div style={{fontSize:12,fontWeight:700,color:calPct>100?C.red:C.text}}>{fmt(todayNet)}/{fmt(goal)} kcal net</div>
             <div style={{display:"flex",gap:4,marginTop:4,justifyContent:"flex-end"}}>
               <div style={{width:70,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
                 <div style={{width:`${Math.min(100,calPct)}%`,height:"100%",background:calPct>100?C.red:C.accent,borderRadius:99,transition:"width 0.4s"}}/>
@@ -2212,15 +2357,15 @@ export default function App() {
 
       {/* Content */}
       <div style={{padding:"12px 12px 0"}}>
-        {tab==="coach" && <CoachMerged {...sharedProps}/>}
-        {tab==="food"  && <FoodTab profile={profile} foodLog={foodLog} setFoodLog={setFoodLog} savedMeals={savedMeals} setSavedMeals={setSavedMeals} discipline={discipline}/>}
-        {tab==="train" && <TrainMerged {...sharedProps}/>}
-        {tab==="body"  && <BodyMerged {...sharedProps}/>}
-        {tab==="more"  && <SettingsMerged profile={profile} foodLog={foodLog} workouts={workouts} walks={walks} checkins={checkins} savedMeals={savedMeals} hydration={hydration} recovery={recovery} prs={prs} onImport={handleImport}/>}
+        {tab==="coach"&&<CoachMerged {...sharedProps}/>}
+        {tab==="food"&&<FoodTab profile={profile} foodLog={foodLog} setFoodLog={setFoodLog} savedMeals={savedMeals} setSavedMeals={setSavedMeals} discipline={discipline}/>}
+        {tab==="train"&&<TrainMerged {...sharedProps}/>}
+        {tab==="body"&&<BodyMerged {...sharedProps}/>}
+        {tab==="more"&&<SettingsMerged profile={profile} foodLog={foodLog} workouts={workouts} walks={walks} checkins={checkins} savedMeals={savedMeals} hydration={hydration} recovery={recovery} prs={prs} onImport={handleImport} onReplayTutorial={replayTutorial}/>}
       </div>
 
-      {/* Bottom Nav — 5 tabs */}
-      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:`${C.surface}f8`,backdropFilter:"blur(20px)",borderTop:`1px solid ${C.border}`,display:"flex",padding:"6px 0 calc(6px + env(safe-area-inset-bottom))"}}>
+      {/* Bottom Nav */}
+      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:`${C.surface}f8`,backdropFilter:"blur(20px)",borderTop:"1px solid "+C.border,display:"flex",padding:"6px 0 calc(6px + env(safe-area-inset-bottom))"}}>
         {tabs.map(t=>(
           <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"4px 0",transition:"all 0.2s",minWidth:0}}>
             <span style={{fontSize:18,filter:tab===t.id?"none":"grayscale(1) opacity(0.35)"}}>{t.icon}</span>
