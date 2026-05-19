@@ -1226,11 +1226,13 @@ const VoiceWorkoutLog = ({onLog, onClose}) => {
     setPhase("processing");
     try {
       const r = await analyzeWorkoutTranscript(text);
-      if (!r.exercises || r.exercises.length === 0) throw new Error("No exercises found");
+      const hasExercises = r.exercises && r.exercises.length > 0;
+      const hasCardio = r.cardio && r.cardio.length > 0;
+      if (!hasExercises && !hasCardio) throw new Error("Nothing parsed — no cardio or exercises found");
       setResult(r);
       setPhase("result");
     } catch(e) {
-      setErrorMsg("Could not parse workout. Try being more specific, e.g. '3 sets of 10 reps of 135lb bench press'.");
+      setErrorMsg("Could not parse. Try: '45 minutes of swimming' or '3 sets of 10 reps of 135lb bench press'.");
       setPhase("error");
     }
   };
