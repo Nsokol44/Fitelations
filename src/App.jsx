@@ -39,8 +39,20 @@ const calcWaterGoalOz = (profile, workedOutToday=false) => {
 // MET-based: lift=5, cardio=7, outdoor=4, sport=6 · formula: MET × weight(kg) × hours
 const calcWorkoutBurn = (workout, weightLb) => {
   const kg = (weightLb||250) * 0.453592;
-  const MET = {lift:5, cardio:7, outdoor:4, sport:6};
-  const met = MET[workout.type] || 5;
+  // Granular MET values per activity type
+  const MET_TABLE = {
+    lift:5.0, cardio:7.0, outdoor:4.0, sport:6.0,
+    swimming:8.3, swim:8.3,
+    running:9.0, run:9.0, jogging:7.0,
+    cycling:7.5, biking:7.5, bike:7.5,
+    rowing:7.5, row:7.5,
+    elliptical:5.0,
+    walking:3.8, walk:3.8,
+    hiking:6.0, hike:6.0,
+  };
+  // Check for a specific activity name stored on cardio entries
+  const actKey = (workout.cardioActivity||"").toLowerCase().replace(/\s+/g,"");
+  const met = MET_TABLE[actKey] || MET_TABLE[workout.type] || 5.0;
   // For lifts, estimate duration from number of sets (avg 3 min/set including rest)
   let hours;
   if (workout.type === "lift") {
@@ -161,11 +173,49 @@ Return ONLY raw JSON (no markdown):
 }`, 900));
 
 const analyzeWorkoutTranscript = async (transcript) => parseJ(await aiText(
-  `Parse this spoken workout into structured exercise data. Extract every exercise with sets, reps, and weight.
+  `Parse this spoken workout description. It may be lifting (sets/reps/weight) OR cardio (time/distance/activity) OR a mix of both.
 Transcript: "${transcript}"
-Return ONLY raw JSON (no markdown):
-{"exercises":[{"exercise":"exercise name","sets":"number as string","reps":"number as string","weight":"number as string","unit":"lb or kg","notes":"extra info or empty"}],"summary":"one sentence describing the full workout"}
-Rules: assume lb if unit not stated. Assume 1 set if not mentioned. Normalize to standard gym exercise names.`, 800));
+
+First determine the workout_type:
+- "lift" if it's purely sets, reps, weight (bench press, squats, deadlifts, kettlebell work, etc.)
+- "cardio" if it's purely time/distance based (swimming, running, cycling, rowing, walking, elliptical, etc.)
+- "mixed" if it contains both
+
+Return ONLY raw JSON (no markdown, no backticks):
+{
+  "workout_type": "lift|cardio|mixed",
+  "summary": "one sentence describing the full workout",
+  "cardio": [
+    {
+      "activity": "activity name (e.g. Swimming, Running, Cycling)",
+      "duration_minutes": number,
+      "distance": "e.g. 1.5 miles or empty string",
+      "intensity": "light|moderate|vigorous",
+      "notes": "any extra detail e.g. freestyle and breaststroke"
+    }
+  ],
+  "exercises": [
+    {
+      "exercise": "exercise name",
+      "sets": "number as string",
+      "reps": "number as string",
+      "weight": "number as string",
+      "unit": "lb or kg",
+      "notes": "extra info or empty"
+    }
+  ]
+}
+
+Cardio MET guidance for intensity:
+- Swimming vigorous=9.8, moderate=7.0, light=5.8
+- Running vigorous=11.5, moderate=8.3, light=6.0
+- Cycling vigorous=10.0, moderate=7.5, light=5.5
+- Rowing vigorous=8.5, moderate=7.0
+- Elliptical moderate=5.0
+- Walking brisk=4.3, normal=3.5
+
+If no cardio, return empty array for cardio. If no lifting, return empty array for exercises.
+Normalize exercise names to standard gym terminology.`, 1000));
 
 
 // ── Theme ────────────────────────────────────────────────────────────────────
@@ -1187,13 +1237,7 @@ const VoiceWorkoutLog = ({onLog, onClose}) => {
 
   const confirmLog = () => {
     if (!result) return;
-    const sets = result.exercises.map(ex => ({
-      exercise: ex.exercise,
-      weight: ex.weight,
-      reps: ex.reps,
-      sets: ex.sets,
-    }));
-    onLog(sets, result.summary);
+    onLog(result); // pass full parsed result — logVoiceWorkout handles lift/cardio/mixed
   };
 
   return (
@@ -1281,22 +1325,43 @@ const VoiceWorkoutLog = ({onLog, onClose}) => {
       {/* Result */}
       {phase==="result" && result && (
         <div style={{animation:"slideIn 0.3s ease"}}>
-          {result.summary && <div style={{fontSize:12,color:C.muted,marginBottom:12,fontStyle:"italic"}}>{result.summary}</div>}
-          <div style={{background:C.surface,borderRadius:10,padding:"10px 13px",marginBottom:12}}>
-            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:4,marginBottom:8}}>
-              {["Exercise","Weight","Reps","Sets"].map(h=>(
-                <div key={h} style={{fontSize:9,color:C.muted,textTransform:"uppercase",letterSpacing:0.6}}>{h}</div>
+          {result.summary && <div style={{fontSize:12,color:C.muted,marginBottom:10,fontStyle:"italic"}}>{result.summary}</div>}
+
+          {/* Cardio section */}
+          {(result.cardio||[]).length>0&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.blue,textTransform:"uppercase",letterSpacing:0.8,fontWeight:700,marginBottom:6}}>🏊 Cardio</div>
+              {result.cardio.map((c,i)=>(
+                <div key={i} style={{background:C.surface,borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                  <Inp label="Activity" value={c.activity||""} onChange={e=>setResult(p=>({...p,cardio:p.cardio.map((x,xi)=>xi===i?{...x,activity:e.target.value}:x)}))}/>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                    <Inp label="Duration (min)" type="number" value={c.duration_minutes||""} onChange={e=>setResult(p=>({...p,cardio:p.cardio.map((x,xi)=>xi===i?{...x,duration_minutes:+e.target.value}:x)}))}/>
+                    <Inp label="Distance (optional)" value={c.distance||""} onChange={e=>setResult(p=>({...p,cardio:p.cardio.map((x,xi)=>xi===i?{...x,distance:e.target.value}:x)}))}/>
+                  </div>
+                  <Inp label="Notes" value={c.notes||""} onChange={e=>setResult(p=>({...p,cardio:p.cardio.map((x,xi)=>xi===i?{...x,notes:e.target.value}:x)}))}/>
+                  <div style={{fontSize:11,color:C.blue}}>Intensity: <Tag color={C.blue}>{c.intensity||"moderate"}</Tag></div>
+                </div>
               ))}
             </div>
-            {result.exercises.map((ex,i)=>(
-              <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:4,padding:"6px 0",borderTop:"1px solid "+C.border}}>
-                <div style={{fontSize:12,fontWeight:600,color:C.accent}}>{ex.exercise}</div>
-                <div style={{fontSize:12,color:C.text}}>{ex.weight}{ex.unit||"lb"}</div>
-                <div style={{fontSize:12,color:C.text}}>{ex.reps}</div>
-                <div style={{fontSize:12,color:C.text}}>{ex.sets}</div>
-              </div>
-            ))}
-          </div>
+          )}
+
+          {/* Lifting section */}
+          {(result.exercises||[]).length>0&&(
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:11,color:C.accent,textTransform:"uppercase",letterSpacing:0.8,fontWeight:700,marginBottom:6}}>🏋️ Lifting</div>
+              {result.exercises.map((ex,i)=>(
+                <div key={i} style={{background:C.surface,borderRadius:10,padding:"10px 12px",marginBottom:8}}>
+                  <Inp label="Exercise" value={ex.exercise||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,exercise:e.target.value}:x)}))}/>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                    <Inp label={"Weight ("+(ex.unit||"lb")+")"} type="number" value={ex.weight||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,weight:e.target.value}:x)}))}/>
+                    <Inp label="Reps" type="number" value={ex.reps||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,reps:e.target.value}:x)}))}/>
+                    <Inp label="Sets" type="number" value={ex.sets||""} onChange={e=>setResult(p=>({...p,exercises:p.exercises.map((x,xi)=>xi===i?{...x,sets:e.target.value}:x)}))}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           <div style={{fontSize:10,color:C.muted,fontStyle:"italic",marginBottom:10,padding:"5px 10px",background:C.surface,borderRadius:8}}>
             "{editText||transcript}"
           </div>
@@ -1327,13 +1392,45 @@ const WorkoutTab = ({workouts,setWorkouts,prs,setPrs,checkins,discipline}) => {
   const addSet=()=>setSets(p=>[...p,{exercise:"",weight:"",reps:"",sets:""}]);
   const updSet=(i,f,v)=>setSets(p=>p.map((s,idx)=>idx===i?{...s,[f]:v}:s));
 
-  const logVoiceWorkout=(parsedSets, summary)=>{
-    const entry={id:Date.now(),date:today(),type:"lift",sets:parsedSets,voiceNote:summary};
-    const updated=[entry,...workouts];
+  const logVoiceWorkout=(parsedResult)=>{
+    const {workout_type, exercises=[], cardio=[], summary=""} = parsedResult;
+    const entries = [];
+
+    // Log each cardio activity as its own entry
+    cardio.forEach(c=>{
+      entries.push({
+        id:Date.now()+Math.random(),
+        date:today(),
+        type:"cardio",
+        cardioActivity: c.activity,
+        duration: c.duration_minutes,
+        notes: [c.activity, c.distance, c.notes].filter(Boolean).join(" · "),
+        voiceNote: summary,
+      });
+    });
+
+    // Log lifting exercises if any
+    if (exercises.length > 0) {
+      entries.push({
+        id:Date.now()+Math.random(),
+        date:today(),
+        type:"lift",
+        sets: exercises,
+        voiceNote: summary,
+      });
+    }
+
+    // If somehow empty (shouldn't happen), log as generic cardio
+    if (entries.length===0) {
+      entries.push({id:Date.now(),date:today(),type:"cardio",duration:30,notes:summary,voiceNote:summary});
+    }
+
+    const updated=[...entries,...workouts];
     setWorkouts(updated);save(KEYS.workouts,updated);
-    // PR detection
+
+    // PR detection for lifts only
     const newPRs={...prs};
-    parsedSets.filter(s=>s.exercise&&s.weight).forEach(s=>{
+    exercises.filter(s=>s.exercise&&s.weight).forEach(s=>{
       const key=s.exercise.toLowerCase().trim();
       const w=parseFloat(s.weight);
       if(!newPRs[key]||w>newPRs[key].weight) newPRs[key]={weight:w,reps:s.reps,date:today(),exercise:s.exercise};
@@ -1452,7 +1549,7 @@ const WorkoutTab = ({workouts,setWorkouts,prs,setPrs,checkins,discipline}) => {
 
       {showVoiceW&&(
         <VoiceWorkoutLog
-          onLog={logVoiceWorkout}
+          onLog={(result)=>logVoiceWorkout(result)}
           onClose={()=>setShowVoiceW(false)}
         />
       )}
@@ -1504,6 +1601,14 @@ const WorkoutTab = ({workouts,setWorkouts,prs,setPrs,checkins,discipline}) => {
             </div>
             <button onClick={()=>del(w.id)} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:16}}>×</button>
           </div>
+          {/* Cardio detail */}
+          {w.type==="cardio"&&w.cardioActivity&&(
+            <div style={{marginTop:8,fontSize:12,color:C.blue}}>
+              {w.cardioActivity} · {w.duration}min
+              {w.notes&&w.notes!==w.cardioActivity&&<span style={{color:C.muted}}> · {w.notes}</span>}
+            </div>
+          )}
+          {/* Lift sets table */}
           {w.sets?.length>0&&(
             <div style={{marginTop:10}}>
               <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:3,marginBottom:5}}>
@@ -1999,6 +2104,64 @@ const DataTab = ({profile,foodLog,workouts,walks,checkins,savedMeals,hydration,r
         </label>
         <div style={{fontSize:11,color:C.muted,marginTop:8,textAlign:"center"}}>
           Tap the button above → select your fitelations-[date].json file
+        </div>
+      </Card>
+
+      {/* How storage works */}
+      <Card style={{marginBottom:12,border:"1px solid "+C.border}}>
+        <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:12}}>📖 How Data Storage Works</div>
+        {[
+          {
+            icon:"💾",
+            title:"Auto-saves instantly",
+            body:"Every meal, workout, walk, and check-in saves automatically to your browser's local storage the moment you log it. There is no manual save button — if you logged it, it's saved."
+          },
+          {
+            icon:"📸",
+            title:"Exports are snapshots, not sync files",
+            body:"Each export creates a new dated file (fitelations-2026-05-19.json) capturing everything at that moment. It does not auto-update. Every time you export, you get a fresh snapshot. Keep the most recent one."
+          },
+          {
+            icon:"⚠️",
+            title:"Data lives on this device and browser only",
+            body:"Your data is stored in this specific browser on this specific device. Switching from Safari to Chrome, clearing your browser history, or uninstalling the app will erase everything. Your export file is your only backup."
+          },
+          {
+            icon:"📱",
+            title:"Moving to a new device",
+            body:"Export on your old device → save the file to iCloud or Google Drive → open Fitelations on your new device → import the file. All your history, meals, workouts, and PRs will be restored."
+          },
+          {
+            icon:"🔄",
+            title:"Using two devices",
+            body:"Fitelations does not sync automatically between devices. To keep two devices in sync: export from device A → import on device B. Do this whenever you want to transfer your latest data."
+          },
+          {
+            icon:"📅",
+            title:"Day tracking accuracy",
+            body:"Every entry is date-stamped using your device's local clock. Daily totals, charts, and the Coach all filter by exact date. As long as your device clock is correct, your daily data is accurate."
+          },
+        ].map((item,i)=>(
+          <div key={i} style={{
+            display:"flex",gap:12,padding:"10px 0",
+            borderBottom:i<5?"1px solid "+C.border:undefined
+          }}>
+            <span style={{fontSize:20,flexShrink:0,marginTop:1}}>{item.icon}</span>
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:C.text,marginBottom:3}}>{item.title}</div>
+              <div style={{fontSize:12,color:C.muted,lineHeight:1.6}}>{item.body}</div>
+            </div>
+          </div>
+        ))}
+      </Card>
+
+      <Card style={{border:"1px solid "+C.blue+"44",background:C.blueD}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.blue,marginBottom:6}}>💡 Recommended Routine</div>
+        <div style={{fontSize:12,color:C.text,lineHeight:1.7}}>
+          <div style={{marginBottom:4}}>📅 <strong>Daily:</strong> Just use the app — everything saves automatically.</div>
+          <div style={{marginBottom:4}}>📤 <strong>Weekly:</strong> Tap Export Data → save the file to iCloud / Google Drive.</div>
+          <div style={{marginBottom:4}}>🔁 <strong>New device:</strong> Import your latest export file to restore everything.</div>
+          <div>🚨 <strong>Before clearing browser:</strong> Always export first or your data is gone permanently.</div>
         </div>
       </Card>
     </div>
