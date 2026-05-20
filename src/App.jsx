@@ -2216,7 +2216,7 @@ const SettingsTab = ({onReplayTutorial}) => {
   );
 
   const KField = ({label, field, show, toggle, ph}) => (
-    <div style={{marginBottom:10}}>
+    <div style={{marginBottom:10}} onClick={e=>e.stopPropagation()} onTouchStart={e=>e.stopPropagation()}>
       <div style={{fontSize:11,color:C.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:0.7}}>{label}</div>
       <div style={{display:"flex",gap:6}}>
         <input
@@ -2226,23 +2226,30 @@ const SettingsTab = ({onReplayTutorial}) => {
           autoCapitalize="off"
           spellCheck="false"
           value={cfg[field]}
-          onChange={e=>update(field,e.target.value)}
+          onChange={e=>{ e.stopPropagation(); update(field,e.target.value); }}
+          onClick={e=>e.stopPropagation()}
+          onFocus={e=>e.stopPropagation()}
+          onTouchEnd={e=>e.stopPropagation()}
           placeholder={ph}
           style={{
-            flex:1, background:C.card, border:"1px solid "+C.border,
-            borderRadius:9, padding:"9px 12px", color:C.text,
-            fontSize:show?12:13, fontFamily:show?"'Space Mono',monospace":"inherit",
-            outline:"none",
-            // When hidden: blur with letter-spacing trick instead of password type
+            flex:1, background:C.surface, border:"1px solid "+C.accentM,
+            borderRadius:9, padding:"11px 13px", color:C.text,
+            fontSize:13, fontFamily:"inherit", outline:"none",
             WebkitTextSecurity: show?"none":"disc",
-            letterSpacing: show?"0":"2px",
           }}
         />
-        <button onClick={e=>{e.stopPropagation();toggle();}} style={{background:C.card,border:"1px solid "+C.border,borderRadius:9,padding:"0 14px",color:C.muted,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:600,flexShrink:0}}>
+        <button
+          onClick={e=>{e.stopPropagation();toggle();}}
+          onTouchEnd={e=>{e.stopPropagation();e.preventDefault();toggle();}}
+          style={{background:C.surface,border:"1px solid "+C.border,borderRadius:9,padding:"0 14px",color:C.muted,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:600,flexShrink:0}}
+        >
           {show?"Hide":"Show"}
         </button>
       </div>
-      {cfg[field]&&!show&&<div style={{fontSize:10,color:C.muted,marginTop:4}}>Key saved · tap Show to reveal · paste works normally</div>}
+      {cfg[field]
+        ?<div style={{fontSize:10,color:C.success,marginTop:4}}>Key entered · tap Show to verify · paste works normally</div>
+        :<div style={{fontSize:10,color:C.muted,marginTop:4}}>Tap the field above to type or paste your key</div>
+      }
     </div>
   );
 
