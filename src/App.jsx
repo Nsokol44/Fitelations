@@ -1,12 +1,53 @@
 import { useState, useEffect, useRef } from "react";
 
 // ── Storage ──────────────────────────────────────────────────────────────────
-const KEYS = {
+const BASE_KEYS = {
   profile:"fc3_profile", foodLog:"fc3_food", workouts:"fc3_workouts",
   walks:"fc3_walks", checkins:"fc3_checkins", savedMeals:"fc3_meals",
   hydration:"fc3_hydration", recovery:"fc3_recovery", prs:"fc3_prs",
   discipline:"fc3_discipline"
 };
+
+// ── Multi-profile support ────────────────────────────────────────────────────
+// Lets two+ people share one browser/device without mixing data. The "default"
+// profile always maps to the original, unprefixed keys this app already used
+// before profiles existed — so anyone already using Fitelations keeps 100% of
+// their data with zero migration. Only additional profiles get a suffix.
+const PROFILES_KEY = "fc3_profiles";
+const ACTIVE_PROFILE_KEY = "fc3_active_profile";
+const DEFAULT_PROFILE = { id: "default", name: "Profile 1", createdAt: null };
+
+const loadProfiles = () => {
+  try {
+    const r = JSON.parse(localStorage.getItem(PROFILES_KEY) || "null");
+    return (r && r.length) ? r : [DEFAULT_PROFILE];
+  } catch { return [DEFAULT_PROFILE]; }
+};
+const saveProfiles = list => { try { localStorage.setItem(PROFILES_KEY, JSON.stringify(list)); } catch {} };
+const getActiveProfileId = () => { try { return localStorage.getItem(ACTIVE_PROFILE_KEY) || "default"; } catch { return "default"; } };
+const setActiveProfileId = id => { try { localStorage.setItem(ACTIVE_PROFILE_KEY, id); } catch {} };
+const profileScopedKey = base => {
+  const pid = getActiveProfileId();
+  return (pid && pid !== "default") ? `${base}::${pid}` : base;
+};
+// Wipes one profile's data (all app keys + meal-plan keys) without deleting the
+// profile slot itself — used by both "clear this profile" and "delete profile".
+const wipeProfileData = id => {
+  const suffix = (id && id !== "default") ? `::${id}` : "";
+  Object.values(BASE_KEYS).forEach(base => { try { localStorage.removeItem(base + suffix); } catch {} });
+  ["fc3_mealplan_settings", "fc3_mealplan_overrides", "fc3_mealplan_grocery_checked"].forEach(base => {
+    try { localStorage.removeItem(base + suffix); } catch {}
+  });
+};
+
+// KEYS.foodLog etc. now transparently resolve to the active profile's copy —
+// every existing call site (dozens of them, unchanged) keeps working as-is.
+const KEYS = new Proxy(BASE_KEYS, {
+  get(target, prop) {
+    if (!(prop in target)) return undefined;
+    return profileScopedKey(target[prop]);
+  }
+});
 const load = (k,fb) => { try { const r=localStorage.getItem(k); return r?JSON.parse(r):fb; } catch { return fb; } };
 const save = (k,v) => { try { localStorage.setItem(k,JSON.stringify(v)); } catch {} };
 
@@ -621,7 +662,81 @@ const ShamePanel = ({todayCal,goal,proteinEaten,proteinGoal,walkedToday,workedOu
 // ══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
-const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs,discipline}) => {
+// ══════════════════════════════════════════════════════════════════════════════
+// NEXT MEAL — quick-log widget for the Coach dashboard. Reads the same meal
+// plan data/functions the Food → Plan tab uses; logs straight into foodLog so
+// it stays in sync with everything else. Chronological (not slot-array) order
+// so "next up" reflects actual time of day, not internal ordering.
+// ══════════════════════════════════════════════════════════════════════════════
+const SLOT_CHRONO = ["breakfast", "lunch", "snack", "dinner"];
+
+const NextMealCard = ({ foodLog, setFoodLog }) => {
+  const [settings] = useState(loadMealPlanSettings);
+  const hasSetup = !!localStorage.getItem(profileScopedKey(MEALPLAN_KEY));
+  const [overrides, setOverridesState] = useState({});
+
+  const target = settings.proteinTarget || 180;
+  const weekSeed = `${isoWeekNumber()}-${settings.cuisines.slice().sort().join(",")}-${settings.proteinSources.slice().sort().join(",")}-${settings.maxPrepTime || "none"}`;
+
+  useEffect(() => { setOverridesState(loadMealPlanOverrides(weekSeed)); }, [weekSeed]);
+
+  if (!hasSetup) {
+    return (
+      <Card style={{ marginBottom: 12, border: `1px solid ${C.accentM}` }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 6 }}>🍽 No meal plan yet</div>
+        <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.5 }}>Set a protein target and your kitchens once in Food → Plan, and your week builds itself — with a quick-log card right here every day.</div>
+      </Card>
+    );
+  }
+
+  const { plan: weekPlan } = buildWeekPlan(settings.cuisines, settings.proteinSources, settings.maxPrepTime, settings.bannedRecipes, target, weekSeed);
+  const todayIndex = new Date().getDay();
+  const todayDateKey = today();
+
+  const recipeAt = slotId => {
+    const ov = overrides[slotId] && overrides[slotId][todayIndex];
+    if (ov) { const found = RECIPES.find(r => r.id === ov); if (found) return found; }
+    return weekPlan[slotId][todayIndex];
+  };
+  const isLoggedHere = (slotId, recipeId) => foodLog.some(e => e.date === todayDateKey && e.mealPlanRecipeId === recipeId && e.mealPlanSlot === slotId);
+
+  const nextSlotId = SLOT_CHRONO.find(sid => {
+    const r = recipeAt(sid);
+    return r && !isLoggedHere(sid, r.id);
+  });
+
+  if (!nextSlotId) {
+    return (
+      <Card style={{ marginBottom: 12, border: `1px solid ${C.success}44` }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.success }}>✅ All of today's planned meals are logged</div>
+      </Card>
+    );
+  }
+
+  const slot = SLOTS.find(s => s.id === nextSlotId);
+  const recipe = recipeAt(nextSlotId);
+
+  const logIt = () => {
+    const { carbs, fat } = estimateMacros(recipe.calories, recipe.protein);
+    const entry = { id: Date.now() + Math.random(), date: todayDateKey, name: recipe.name, calories: recipe.calories, protein: recipe.protein, carbs, fat, mealPlanRecipeId: recipe.id, mealPlanSlot: nextSlotId };
+    const nl = [entry, ...foodLog];
+    setFoodLog(nl); save(KEYS.foodLog, nl);
+  };
+
+  return (
+    <Card style={{ marginBottom: 12 }} glow={C.accent}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+        <Tag color={C.orange}>Next up · {slot.label}</Tag>
+        <span style={{ fontSize: 10, color: C.muted }}>{slot.time}</span>
+      </div>
+      <div style={{ fontSize: 16, fontWeight: 800, color: C.text, marginTop: 6 }}>{recipe.name}</div>
+      <div style={{ fontSize: 11, color: C.muted, marginTop: 2, marginBottom: 12 }}>{recipe.protein}g protein · {recipe.calories} cal · {recipe.time}</div>
+      <Btn onClick={logIt} style={{ width: "100%" }}>✅ Log this meal</Btn>
+    </Card>
+  );
+};
+
+const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs,discipline,setFoodLog}) => {
   const [coach,setCoach]=useState(null);
   const [loadingCoach,setLoadingCoach]=useState(false);
 
@@ -716,6 +831,8 @@ const DashTab = ({profile,foodLog,workouts,checkins,walks,hydration,recovery,prs
       />
 
       <PenaltyAlert level={penalty} eaten={netCal} goal={goal} discipline={discipline}/>
+
+      <NextMealCard foodLog={foodLog} setFoodLog={setFoodLog}/>
 
       {/* Header stats */}
       <Card style={{marginBottom:12}}>
@@ -1898,10 +2015,10 @@ const CheckinTab = ({checkins,setCheckins,profile}) => {
           {saved&&<Tag color={C.success}>✅ Saved</Tag>}
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-          <Inp label="Weight (lbs)" type="number" value={form.weight} onChange={e=>setForm(p=>({...p,weight:e.target.value}))} placeholder="321"/>
-          <Inp label="Waist (in)" type="number" value={form.waist} onChange={e=>setForm(p=>({...p,waist:e.target.value}))} placeholder="48"/>
+          <Inp label="Weight (lbs)" type="number" value={form.weight} onChange={e=>setForm(p=>({...p,weight:e.target.value}))} placeholder="e.g. 180"/>
+          <Inp label="Waist (in)" type="number" value={form.waist} onChange={e=>setForm(p=>({...p,waist:e.target.value}))} placeholder="e.g. 34"/>
         </div>
-        <Inp label="Sleep (hours)" type="number" step="0.5" value={form.sleep} onChange={e=>setForm(p=>({...p,sleep:e.target.value}))} placeholder="7.5"/>
+        <Inp label="Sleep (hours)" type="number" step="0.5" value={form.sleep} onChange={e=>setForm(p=>({...p,sleep:e.target.value}))} placeholder="e.g. 7.5"/>
         <div style={{marginBottom:12}}>
           <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:0.8,marginBottom:6}}>Hunger Level</div>
           <Emoji field="hunger" vals={[{n:1,e:"😌",c:C.success},{n:2,e:"🙂",c:C.accent},{n:3,e:"😐",c:C.yellow},{n:4,e:"😤",c:C.orange},{n:5,e:"🤤",c:C.red}]}/>
@@ -1950,12 +2067,12 @@ const HealthTab = ({profile,setProfile}) => {
         <Card style={{marginBottom:12}} glow={C.accent}>
           <div style={{fontSize:13,fontWeight:700,color:C.text,marginBottom:12}}>Your Profile</div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            <Inp label="Age" type="number" value={draft.age||""} onChange={e=>setDraft(p=>({...p,age:+e.target.value}))}/>
+            <Inp label="Age" type="number" value={draft.age||""} onChange={e=>setDraft(p=>({...p,age:+e.target.value}))} placeholder="e.g. 30"/>
             <Sel label="Sex" value={draft.sex||"male"} onChange={e=>setDraft(p=>({...p,sex:e.target.value}))} options={[{value:"male",label:"Male"},{value:"female",label:"Female"}]}/>
-            <Inp label='Height (in)' type="number" value={draft.height||""} onChange={e=>setDraft(p=>({...p,height:+e.target.value}))} placeholder="76 = 6'4&quot;"/>
-            <Inp label="Weight (lbs)" type="number" value={draft.weight||""} onChange={e=>setDraft(p=>({...p,weight:+e.target.value}))}/>
+            <Inp label='Height (in)' type="number" value={draft.height||""} onChange={e=>setDraft(p=>({...p,height:+e.target.value}))} placeholder="e.g. 68 = 5'8&quot;"/>
+            <Inp label="Weight (lbs)" type="number" value={draft.weight||""} onChange={e=>setDraft(p=>({...p,weight:+e.target.value}))} placeholder="e.g. 180"/>
             <Inp label="Cal Goal" type="number" value={draft.calorieGoal||""} onChange={e=>setDraft(p=>({...p,calorieGoal:+e.target.value}))} placeholder="Auto if blank"/>
-            <Inp label="Protein Goal (g)" type="number" value={draft.proteinGoal||""} onChange={e=>setDraft(p=>({...p,proteinGoal:+e.target.value}))}/>
+            <Inp label="Protein Goal (g)" type="number" value={draft.proteinGoal||""} onChange={e=>setDraft(p=>({...p,proteinGoal:+e.target.value}))} placeholder="Auto if blank"/>
           </div>
           <Sel label="Activity Level" value={draft.activity||"moderate"} onChange={e=>setDraft(p=>({...p,activity:e.target.value}))} options={[
             {value:"sedentary",label:"Sedentary"},
@@ -2440,12 +2557,163 @@ const BodyMerged = (props) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // MERGED TAB: SETTINGS  (AI Settings + Data export/import)
 // ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// PROFILES — switch users, clear data, per-profile or whole-device
+// ══════════════════════════════════════════════════════════════════════════════
+const ProfilesTab = () => {
+  const [profiles, setProfiles] = useState(loadProfiles);
+  const [activeId, setActiveId] = useState(getActiveProfileId);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameVal, setRenameVal] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [confirmClearProfile, setConfirmClearProfile] = useState(false);
+  const [confirmClearDevice, setConfirmClearDevice] = useState(false);
+  const [wipeText, setWipeText] = useState("");
+
+  const persist = list => { setProfiles(list); saveProfiles(list); };
+
+  const switchTo = id => {
+    if (id === activeId) return;
+    setActiveProfileId(id);
+    window.location.reload();
+  };
+
+  const addProfile = () => {
+    const name = newName.trim();
+    if (!name) return;
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const next = [...profiles, { id, name, createdAt: new Date().toISOString() }];
+    persist(next);
+    setNewName(""); setAdding(false);
+    switchTo(id);
+  };
+
+  const renameProfile = id => {
+    const name = renameVal.trim();
+    if (!name) { setRenamingId(null); return; }
+    persist(profiles.map(p => p.id === id ? { ...p, name } : p));
+    setRenamingId(null);
+  };
+
+  const deleteProfile = id => {
+    if (id === "default") return; // the original device profile can be cleared, not deleted — avoids ambiguous fallback state
+    wipeProfileData(id);
+    const next = profiles.filter(p => p.id !== id);
+    persist(next);
+    setConfirmDeleteId(null);
+    if (activeId === id) { setActiveProfileId("default"); window.location.reload(); }
+  };
+
+  const clearActiveProfile = () => {
+    wipeProfileData(activeId);
+    setConfirmClearProfile(false);
+    window.location.reload();
+  };
+
+  const clearWholeDevice = () => {
+    try { localStorage.clear(); } catch {}
+    window.location.reload();
+  };
+
+  const activeProfile = profiles.find(p => p.id === activeId) || profiles[0];
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 12 }} glow={C.accent}>
+        <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 }}>Currently using</div>
+        <div style={{ fontSize: 17, fontWeight: 800, color: C.accent }}>{activeProfile?.name || "Profile 1"}</div>
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.5 }}>Each profile has its own food log, workouts, weight history, and meal plan — switching profiles never mixes data between people.</div>
+      </Card>
+
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, marginBottom: 10 }}>Everyone on this device</div>
+        {profiles.map(p => (
+          <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 0", borderBottom: `1px solid ${C.border}` }}>
+            {renamingId === p.id ? (
+              <>
+                <input value={renameVal} onChange={e => setRenameVal(e.target.value)} autoFocus
+                  style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "7px 10px", color: C.text, fontSize: 13, fontFamily: "inherit" }} />
+                <button onClick={() => renameProfile(p.id)} style={{ background: "none", border: "none", color: C.accent, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Save</button>
+              </>
+            ) : (
+              <>
+                <div onClick={() => switchTo(p.id)} style={{ flex: 1, cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{
+                    width: 8, height: 8, borderRadius: 99, flexShrink: 0,
+                    background: p.id === activeId ? C.accent : C.border,
+                  }} />
+                  <span style={{ fontSize: 13, fontWeight: p.id === activeId ? 700 : 400, color: p.id === activeId ? C.text : C.muted }}>{p.name}</span>
+                  {p.id === activeId && <Tag color={C.accent}>Active</Tag>}
+                </div>
+                <button onClick={() => { setRenamingId(p.id); setRenameVal(p.name); }} style={{ background: "none", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", fontWeight: 700 }}>Rename</button>
+                {p.id !== "default" && (
+                  confirmDeleteId === p.id ? (
+                    <button onClick={() => deleteProfile(p.id)} style={{ background: "none", border: "none", color: C.red, fontSize: 11, cursor: "pointer", fontWeight: 700 }}>Confirm delete?</button>
+                  ) : (
+                    <button onClick={() => setConfirmDeleteId(p.id)} style={{ background: "none", border: "none", color: C.muted, fontSize: 11, cursor: "pointer" }}>×</button>
+                  )
+                )}
+              </>
+            )}
+          </div>
+        ))}
+
+        {adding ? (
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Jordan" autoFocus
+              onKeyDown={e => e.key === "Enter" && addProfile()}
+              style={{ flex: 1, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "9px 12px", color: C.text, fontSize: 13, fontFamily: "inherit" }} />
+            <Btn onClick={addProfile} sm>Add</Btn>
+            <Btn onClick={() => { setAdding(false); setNewName(""); }} variant="ghost" sm>Cancel</Btn>
+          </div>
+        ) : (
+          <Btn onClick={() => setAdding(true)} variant="ghost" style={{ width: "100%", marginTop: 10 }} sm>+ Add a profile</Btn>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 12, border: `1px solid ${C.yellow}44` }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.yellow, marginBottom: 6 }}>🧹 Clear {activeProfile?.name || "this profile"}'s data</div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>Erases food logs, workouts, walks, check-ins, PRs, and meal plan for the currently active profile only. The profile itself stays — it just starts empty again.</div>
+        {confirmClearProfile ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn onClick={clearActiveProfile} variant="danger" style={{ flex: 1 }}>Yes, erase {activeProfile?.name}'s data</Btn>
+            <Btn onClick={() => setConfirmClearProfile(false)} variant="ghost">Cancel</Btn>
+          </div>
+        ) : (
+          <Btn onClick={() => setConfirmClearProfile(true)} variant="warn" style={{ width: "100%" }}>Clear this profile's data</Btn>
+        )}
+      </Card>
+
+      <Card style={{ border: `1px solid ${C.red}44` }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: C.red, marginBottom: 6 }}>⚠️ Reset this device completely</div>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>Deletes every profile and all their data from this browser — food logs, workouts, AI settings, everything. Use this before returning, selling, or wiping a shared computer. This cannot be undone; export first if you want a backup.</div>
+        {confirmClearDevice ? (
+          <div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>Type <strong style={{ color: C.red }}>DELETE</strong> to confirm:</div>
+            <input value={wipeText} onChange={e => setWipeText(e.target.value)} placeholder="DELETE"
+              style={{ width: "100%", boxSizing: "border-box", background: C.surface, border: `1px solid ${C.red}66`, borderRadius: 8, padding: "9px 12px", color: C.text, fontSize: 13, fontFamily: "inherit", marginBottom: 10 }} />
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn onClick={clearWholeDevice} variant="danger" disabled={wipeText !== "DELETE"} style={{ flex: 1 }}>Erase everything</Btn>
+              <Btn onClick={() => { setConfirmClearDevice(false); setWipeText(""); }} variant="ghost">Cancel</Btn>
+            </div>
+          </div>
+        ) : (
+          <Btn onClick={() => setConfirmClearDevice(true)} variant="danger" style={{ width: "100%" }}>Reset this device</Btn>
+        )}
+      </Card>
+    </div>
+  );
+};
+
 const SettingsMerged = (props) => {
   const [sub, setSub] = useState("ai");
-  const subTabs = [{id:"ai",icon:"⚙️",label:"AI"},{id:"data",icon:"💾",label:"Data"}];
+  const subTabs = [{id:"profiles",icon:"👤",label:"Profiles"},{id:"ai",icon:"⚙️",label:"AI"},{id:"data",icon:"💾",label:"Data"}];
   return (
     <div>
       <SubNav tabs={subTabs} active={sub} onChange={setSub}/>
+      {sub==="profiles" && <ProfilesTab/>}
       {sub==="ai"   && <SettingsTab onReplayTutorial={props.onReplayTutorial}/>}
       {sub==="data" && <DataTab {...props}/>}
     </div>
@@ -3132,11 +3400,11 @@ const estimateMacros = (calories, protein) => {
 
 const MEALPLAN_KEY = "fc3_mealplan_settings";
 const MEALPLAN_OVERRIDES_KEY = "fc3_mealplan_overrides";
-const MEALPLAN_DEFAULTS = { proteinTarget: 180, calorieTarget: null, cuisines: [], proteinSources: ALL_SOURCE_IDS, maxPrepTime: null, bannedRecipes: [], reminders: { enabled: false, times: { breakfast: "08:00", lunch: "12:30", dinner: "18:30", snack: "15:30" } } };
-const loadMealPlanSettings = () => { try { return { ...MEALPLAN_DEFAULTS, ...JSON.parse(localStorage.getItem(MEALPLAN_KEY) || "{}") }; } catch { return MEALPLAN_DEFAULTS; } };
-const saveMealPlanSettings = cfg => { try { localStorage.setItem(MEALPLAN_KEY, JSON.stringify(cfg)); } catch {} };
-const loadMealPlanOverrides = seed => { try { const all = JSON.parse(localStorage.getItem(MEALPLAN_OVERRIDES_KEY) || "{}"); return all[seed] || {}; } catch { return {}; } };
-const saveMealPlanOverrides = (seed, val) => { try { const all = JSON.parse(localStorage.getItem(MEALPLAN_OVERRIDES_KEY) || "{}"); all[seed] = val; localStorage.setItem(MEALPLAN_OVERRIDES_KEY, JSON.stringify(all)); } catch {} };
+const MEALPLAN_DEFAULTS = { proteinTarget: null, calorieTarget: null, cuisines: [], proteinSources: ALL_SOURCE_IDS, maxPrepTime: null, bannedRecipes: [], reminders: { enabled: false, times: { breakfast: "08:00", lunch: "12:30", dinner: "18:30", snack: "15:30" } } };
+const loadMealPlanSettings = () => { try { return { ...MEALPLAN_DEFAULTS, ...JSON.parse(localStorage.getItem(profileScopedKey(MEALPLAN_KEY)) || "{}") }; } catch { return MEALPLAN_DEFAULTS; } };
+const saveMealPlanSettings = cfg => { try { localStorage.setItem(profileScopedKey(MEALPLAN_KEY), JSON.stringify(cfg)); } catch {} };
+const loadMealPlanOverrides = seed => { try { const all = JSON.parse(localStorage.getItem(profileScopedKey(MEALPLAN_OVERRIDES_KEY)) || "{}"); return all[seed] || {}; } catch { return {}; } };
+const saveMealPlanOverrides = (seed, val) => { try { const all = JSON.parse(localStorage.getItem(profileScopedKey(MEALPLAN_OVERRIDES_KEY)) || "{}"); all[seed] = val; localStorage.setItem(profileScopedKey(MEALPLAN_OVERRIDES_KEY), JSON.stringify(all)); } catch {} };
 
 const MealChip = ({ active, onClick, children, color = C.accent }) => (
   <button onClick={onClick} style={{
@@ -3154,7 +3422,7 @@ const MealPlanSetup = ({ settings, onSave, onCancel }) => {
       <div style={{ fontSize: 15, fontWeight: 800, color: C.accent, marginBottom: 4 }}>Set up your meal plan</div>
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 16, lineHeight: 1.5 }}>Pick a protein target, the proteins you actually eat, and the kitchens you cook from. We'll build your week from there.</div>
 
-      <Inp label="Daily protein target (g)" type="number" value={local.proteinTarget} onChange={e => setLocal(p => ({ ...p, proteinTarget: +e.target.value || 0 }))} />
+      <Inp label="Daily protein target (g)" type="number" placeholder="e.g. 150 (a common target)" value={local.proteinTarget || ""} onChange={e => setLocal(p => ({ ...p, proteinTarget: e.target.value ? +e.target.value : null }))} />
       <Inp label="Daily calorie target (optional)" type="number" placeholder="No target set" value={local.calorieTarget || ""} onChange={e => setLocal(p => ({ ...p, calorieTarget: e.target.value ? +e.target.value : null }))} />
 
       <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "14px 0 8px" }}>How much time do you have to cook?</div>
@@ -3365,8 +3633,8 @@ const buildGroceryList = (weekDateKeys, recipeAt) => {
   return { grocery, pantry };
 };
 
-const loadGroceryChecked = weekSeed => { try { const all = JSON.parse(localStorage.getItem("fc3_mealplan_grocery_checked") || "{}"); return all[weekSeed] || {}; } catch { return {}; } };
-const saveGroceryChecked = (weekSeed, val) => { try { const all = JSON.parse(localStorage.getItem("fc3_mealplan_grocery_checked") || "{}"); all[weekSeed] = val; localStorage.setItem("fc3_mealplan_grocery_checked", JSON.stringify(all)); } catch {} };
+const loadGroceryChecked = weekSeed => { try { const all = JSON.parse(localStorage.getItem(profileScopedKey("fc3_mealplan_grocery_checked")) || "{}"); return all[weekSeed] || {}; } catch { return {}; } };
+const saveGroceryChecked = (weekSeed, val) => { try { const all = JSON.parse(localStorage.getItem(profileScopedKey("fc3_mealplan_grocery_checked")) || "{}"); all[weekSeed] = val; localStorage.setItem(profileScopedKey("fc3_mealplan_grocery_checked"), JSON.stringify(all)); } catch {} };
 
 const MealGroceryList = ({ weekDateKeys, recipeAt, weekSeed }) => {
   const [checked, setChecked] = useState(() => loadGroceryChecked(weekSeed));
@@ -3459,7 +3727,7 @@ const MealSettingsModal = ({ settings, onSave, onClose }) => {
           <button onClick={onClose} style={{ background: "none", border: "none", color: C.muted, fontSize: 20, cursor: "pointer" }}>×</button>
         </div>
 
-        <Inp label="Daily protein target (g)" type="number" value={local.proteinTarget} onChange={e => setLocal(p => ({ ...p, proteinTarget: +e.target.value || 0 }))} />
+        <Inp label="Daily protein target (g)" type="number" placeholder="e.g. 150 (a common target)" value={local.proteinTarget || ""} onChange={e => setLocal(p => ({ ...p, proteinTarget: e.target.value ? +e.target.value : null }))} />
         <Inp label="Daily calorie target (optional)" type="number" placeholder="No target set" value={local.calorieTarget || ""} onChange={e => setLocal(p => ({ ...p, calorieTarget: e.target.value ? +e.target.value : null }))} />
 
         <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "10px 0 8px" }}>Prep time</div>
@@ -3544,7 +3812,7 @@ const MealSettingsModal = ({ settings, onSave, onClose }) => {
 // ── Root Plan tab ─────────────────────────────────────────────────────────────
 const MealPlanTab = ({ foodLog, setFoodLog }) => {
   const [settings, setSettingsState] = useState(loadMealPlanSettings);
-  const [needsSetup, setNeedsSetup] = useState(() => !localStorage.getItem(MEALPLAN_KEY));
+  const [needsSetup, setNeedsSetup] = useState(() => !localStorage.getItem(profileScopedKey(MEALPLAN_KEY)));
   const [view, setView] = useState("today");
   const [showSettings, setShowSettings] = useState(false);
   const [expanded, setExpanded] = useState(null);
