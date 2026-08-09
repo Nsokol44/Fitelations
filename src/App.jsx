@@ -12,6 +12,21 @@ const save = (k,v) => { try { localStorage.setItem(k,JSON.stringify(v)); } catch
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 const today = () => new Date().toISOString().slice(0,10);
+
+// ── Responsive breakpoints ───────────────────────────────────────────────────
+// mobile: phones. tablet: iPad-class. desktop: laptop/desktop browser windows.
+// (Smartwatches are intentionally not a breakpoint here — see README.)
+const useViewport = () => {
+  const [w, setW] = useState(typeof window !== "undefined" ? window.innerWidth : 390);
+  useEffect(() => {
+    const onResize = () => setW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return w;
+};
+const bpOf = w => w >= 1024 ? "desktop" : w >= 700 ? "tablet" : "mobile";
+const shellMaxWidth = { mobile: 480, tablet: 720, desktop: 1040 };
 const fmt = n => Math.round(n).toLocaleString();
 const fmtDate = d => new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"});
 const last7 = () => Array.from({length:7},(_,i)=>{ const d=new Date(); d.setDate(d.getDate()-6+i); return d.toISOString().slice(0,10); });
@@ -334,6 +349,30 @@ const Sparkline = ({data,color=C.accent,h=50,label,fillColor}) => {
       </div>
     </div>
   );
+};
+
+// ── Notifications ────────────────────────────────────────────────────────────
+// Routes through the service worker (registration.showNotification) instead of
+// bare `new Notification()` — renders as a real system notification and
+// supports tap-to-open. Still requires the app/tab to be alive somewhere in
+// the background; see public/sw.js for the honest limits of that.
+const notify = async (title, body, tab) => {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if ("serviceWorker" in navigator) {
+      const reg = await navigator.serviceWorker.ready;
+      reg.active && reg.active.postMessage({ type: "SHOW_NOTIFICATION", title, body, tab, tag: "fitel-reminder-" + (tab || "app") });
+    } else {
+      new Notification(title, { body });
+    }
+  } catch (e) {}
+};
+const requestNotifPermission = async () => {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") return false;
+  const res = await Notification.requestPermission();
+  return res === "granted";
 };
 
 // ── CSS injection ────────────────────────────────────────────────────────────
@@ -2414,7 +2453,1279 @@ const SettingsMerged = (props) => {
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ROOT APP
+// MEAL PLANNER — recipe data + selection logic
+// ══════════════════════════════════════════════════════════════════════════════
+const CUISINES = [
+  { id: "american-south", label: "American South" },
+  { id: "puerto-rican", label: "Puerto Rican" },
+  { id: "caribbean", label: "Caribbean" },
+  { id: "french", label: "French" },
+  { id: "italian", label: "Italian" },
+  { id: "mexican", label: "Mexican" },
+  { id: "indian", label: "Indian" },
+  { id: "chinese", label: "Chinese" },
+  { id: "mediterranean", label: "Mediterranean" },
+  { id: "thai", label: "Thai" },
+];
+
+const SLOTS = [
+  { id: "breakfast", label: "Breakfast", time: "8:00 AM" },
+  { id: "lunch", label: "Lunch", time: "12:30 PM" },
+  { id: "dinner", label: "Dinner", time: "6:30 PM" },
+  { id: "snack", label: "Snack", time: "3:30 PM" },
+];
+
+// How much of the daily protein target each slot should aim to cover.
+// Used to bias meal selection so a full day's menu lands near the goal.
+// (per-slot weighting removed — day plans are now chosen via a joint search
+// across all 4 slots together, see buildDayCombo)
+
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+const PROTEIN_SOURCES = [
+  { id: "chicken", label: "Chicken" },
+  { id: "beef-pork", label: "Beef & Pork" },
+  { id: "fish-seafood", label: "Fish & Seafood" },
+  { id: "eggs", label: "Eggs" },
+  { id: "dairy", label: "Dairy (cheese, yogurt)" },
+  { id: "beans-legumes", label: "Beans & Legumes" },
+  { id: "tofu", label: "Tofu & Tempeh" },
+  { id: "nuts", label: "Nuts & Seeds" },
+];
+const ALL_SOURCE_IDS = PROTEIN_SOURCES.map((p) => p.id);
+const VEGETARIAN_SOURCE_IDS = ALL_SOURCE_IDS.filter((id) => !["chicken", "beef-pork", "fish-seafood"].includes(id));
+const VEGAN_SOURCE_IDS = VEGETARIAN_SOURCE_IDS.filter((id) => !["eggs", "dairy"].includes(id));
+
+const PRESETS = [
+  { id: "omnivore", label: "Omnivore", sources: ALL_SOURCE_IDS },
+  { id: "vegetarian", label: "Vegetarian", sources: VEGETARIAN_SOURCE_IDS },
+  { id: "vegan", label: "Vegan", sources: VEGAN_SOURCE_IDS },
+];
+
+const TIME_PRESETS = [
+  { id: "15", label: "15 min or less", value: 15 },
+  { id: "30", label: "30 min or less", value: 30 },
+  { id: "45", label: "45 min or less", value: 45 },
+  { id: "none", label: "No limit", value: null },
+];
+
+// Recipe shape: id, cuisine, slot, name, protein, calories, time, proteinSources[], ingredients[], steps[]
+const RECIPES = [
+  // ================= AMERICAN SOUTH =================
+  { id: "as-b1", cuisine: "american-south", slot: "breakfast", name: "Cheesy Grits & Fried Eggs", protein: 28, calories: 480, time: "15 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["1/2 cup dry grits", "1 cup shredded cheddar", "3 large eggs", "1 tbsp butter", "Salt, pepper, hot sauce"],
+    steps: ["Cook grits per package directions in salted water.", "Stir in cheddar until melted and creamy.", "Fry eggs in butter to your liking.", "Spoon grits into a bowl, top with eggs, hot sauce."] },
+  { id: "as-b2", cuisine: "american-south", slot: "breakfast", name: "Black-Eyed Pea & Cheese Hash", protein: 30, calories: 460, time: "20 min", proteinSources: ["eggs", "dairy", "beans-legumes"],
+    ingredients: ["1 cup cooked black-eyed peas", "3 eggs", "1/2 cup shredded cheddar", "1/2 bell pepper, diced", "1/2 onion, diced", "Oil, seasoning salt"],
+    steps: ["Sauté onion and pepper in oil until soft.", "Add black-eyed peas, warm through, season.", "Push to one side, scramble eggs in same pan.", "Combine, top with cheddar until melted."] },
+  { id: "as-b3", cuisine: "american-south", slot: "breakfast", name: "Tofu & Black-Eyed Pea Scramble", protein: 24, calories: 380, time: "20 min", proteinSources: ["tofu", "beans-legumes"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1 cup cooked black-eyed peas", "1/2 tsp turmeric", "1/2 onion, diced", "Nutritional yeast, smoked paprika"],
+    steps: ["Sauté onion until soft.", "Add crumbled tofu and turmeric, cook until golden.", "Stir in black-eyed peas, warm through.", "Season with nutritional yeast and smoked paprika."] },
+  { id: "as-l1", cuisine: "american-south", slot: "lunch", name: "Smothered Chicken & Rice", protein: 48, calories: 560, time: "35 min", proteinSources: ["chicken"],
+    ingredients: ["2 chicken thighs, boneless", "1 cup cooked rice", "1 onion, sliced", "1 cup chicken broth", "2 tbsp flour", "Cajun seasoning"],
+    steps: ["Season and sear chicken until browned, set aside.", "Sauté onions in same pan, sprinkle in flour to make a roux.", "Whisk in broth, simmer until thickened.", "Return chicken, cover, simmer 15 min. Serve over rice."] },
+  { id: "as-l2", cuisine: "american-south", slot: "lunch", name: "Pimento Cheese Chicken Sandwich", protein: 45, calories: 520, time: "15 min", proteinSources: ["chicken", "dairy"],
+    ingredients: ["6 oz cooked chicken breast, shredded", "1/3 cup shredded cheddar", "2 tbsp mayo", "1 tbsp diced pimentos", "2 slices bread", "Pickles"],
+    steps: ["Mix cheddar, mayo, and pimentos into a spread.", "Fold in shredded chicken.", "Pile onto bread, add pickles, serve open-face or closed."] },
+  { id: "as-l3", cuisine: "american-south", slot: "lunch", name: "Shrimp & Grits", protein: 36, calories: 500, time: "25 min", proteinSources: ["fish-seafood", "dairy"],
+    ingredients: ["8 oz shrimp, peeled", "1/2 cup dry grits", "1/3 cup shredded cheddar", "2 strips turkey bacon (optional)", "Cajun seasoning, garlic"],
+    steps: ["Cook grits with cheddar stirred in.", "Season shrimp with Cajun seasoning.", "Sear shrimp with garlic 2-3 min per side until pink.", "Spoon shrimp over cheesy grits."] },
+  { id: "as-d1", cuisine: "american-south", slot: "dinner", name: "Buttermilk Baked Chicken, Collards & Beans", protein: 68, calories: 680, time: "45 min", proteinSources: ["chicken", "beans-legumes", "dairy"],
+    ingredients: ["3 chicken thighs", "1/2 cup buttermilk", "2 cups collard greens", "1 cup white beans, cooked", "1 clove garlic", "Smoked paprika, salt"],
+    steps: ["Marinate chicken in buttermilk 20+ min, then bake at 400°F, 30 min.", "Sauté garlic, add collards and a splash of water, cover and wilt.", "Warm beans with smoked paprika.", "Plate chicken over greens and beans."] },
+  { id: "as-d2", cuisine: "american-south", slot: "dinner", name: "Red Beans & Rice (Vegan)", protein: 26, calories: 460, time: "30 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups red beans, cooked", "1 cup cooked rice", "1/2 onion, diced", "1 celery stalk, diced", "1 bell pepper, diced", "Cajun seasoning"],
+    steps: ["Sauté onion, celery, and pepper until soft.", "Add beans and a splash of broth, simmer 15 min, mashing some beans to thicken.", "Season well, serve over rice."] },
+  { id: "as-d3", cuisine: "american-south", slot: "dinner", name: "Smoked Beef Brisket-Style with Beans", protein: 50, calories: 600, time: "50 min", proteinSources: ["beef-pork", "beans-legumes"],
+    ingredients: ["6 oz beef brisket or chuck, sliced", "1.5 cups baked beans", "1 tbsp smoked paprika", "1 tbsp brown sugar", "BBQ rub"],
+    steps: ["Rub beef with smoked paprika and BBQ seasoning.", "Sear, then braise low and slow (oven 300°F, 2+ hrs, or use pre-cooked deli brisket to save time).", "Warm beans with brown sugar.", "Slice beef, serve alongside beans."] },
+  { id: "as-s1", cuisine: "american-south", slot: "snack", name: "Pimento Cheese & Crackers", protein: 14, calories: 260, time: "5 min", proteinSources: ["dairy"],
+    ingredients: ["1/3 cup shredded cheddar", "1 tbsp mayo", "1 tsp diced pimentos", "Whole grain crackers"],
+    steps: ["Stir cheddar, mayo, and pimentos together.", "Serve with crackers."] },
+  { id: "as-s2", cuisine: "american-south", slot: "snack", name: "Deviled Eggs (2)", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "1 tsp mayo", "1/2 tsp mustard", "Paprika, salt"],
+    steps: ["Halve eggs, scoop yolks into a bowl.", "Mash yolks with mayo and mustard.", "Refill whites, dust with paprika."] },
+  { id: "as-s3", cuisine: "american-south", slot: "snack", name: "Boiled Peanuts", protein: 10, calories: 180, time: "5 min (pre-boiled)", proteinSources: ["nuts"],
+    ingredients: ["1 cup boiled peanuts in shell", "Cajun seasoning (optional)"],
+    steps: ["Warm boiled peanuts if desired.", "Toss with extra seasoning, serve in the shell."] },
+
+  // ================= PUERTO RICAN =================
+  { id: "pr-b1", cuisine: "puerto-rican", slot: "breakfast", name: "Huevos Fritos con Queso y Tostones", protein: 26, calories: 470, time: "20 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["3 eggs", "1/3 cup queso de freír, sliced", "1 green plantain, sliced", "Oil for frying", "Adobo seasoning"],
+    steps: ["Fry plantain slices until golden, smash flat, fry again until crisp.", "Fry eggs in a little oil, season with adobo.", "Pan-fry queso slices until golden on each side.", "Plate eggs, cheese, and tostones together."] },
+  { id: "pr-b2", cuisine: "puerto-rican", slot: "breakfast", name: "Mallorca-Style Egg & Cheese Sandwich", protein: 28, calories: 500, time: "15 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["2 eggs", "2 slices queso de freír or mozzarella", "1 soft roll", "1 tbsp butter", "Powdered sugar (optional)"],
+    steps: ["Scramble or fry eggs to your liking.", "Warm cheese slices until soft.", "Butter and lightly griddle the roll.", "Build sandwich with egg and cheese inside."] },
+  { id: "pr-b3", cuisine: "puerto-rican", slot: "breakfast", name: "Tofu Revuelto con Adobo (Vegan)", protein: 20, calories: 360, time: "15 min", proteinSources: ["tofu"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1/2 onion, diced", "1/2 tomato, diced", "Adobo, turmeric", "Oil"],
+    steps: ["Sauté onion and tomato until soft.", "Add crumbled tofu and turmeric, cook 5 min.", "Season with adobo, serve with rice or tortillas."] },
+  { id: "pr-l1", cuisine: "puerto-rican", slot: "lunch", name: "Pollo Guisado sobre Arroz", protein: 46, calories: 540, time: "40 min", proteinSources: ["chicken"],
+    ingredients: ["2 chicken thighs, cut up", "1 cup cooked white rice", "1/4 cup sofrito", "1 tbsp tomato paste", "1/2 cup chicken broth", "Adobo, sazón"],
+    steps: ["Season chicken with adobo, brown in a pot.", "Add sofrito and tomato paste, cook 2 min.", "Add broth and sazón, cover, simmer 25 min until tender.", "Serve over rice."] },
+  { id: "pr-l2", cuisine: "puerto-rican", slot: "lunch", name: "Habichuelas Guisadas con Queso y Arroz", protein: 30, calories: 500, time: "25 min", proteinSources: ["beans-legumes", "dairy"],
+    ingredients: ["1.5 cups pink beans, cooked", "1/4 cup sofrito", "1/4 cup queso de freír, cubed", "1 cup cooked rice", "1 tbsp tomato sauce", "Adobo"],
+    steps: ["Sauté sofrito, stir in tomato sauce.", "Add beans and a splash of water, simmer 15 min.", "Fold in cheese cubes at the end just to soften.", "Serve over rice."] },
+  { id: "pr-l3", cuisine: "puerto-rican", slot: "lunch", name: "Bacalao Guisado (Stewed Codfish)", protein: 40, calories: 460, time: "35 min", proteinSources: ["fish-seafood"],
+    ingredients: ["8 oz salted codfish, soaked and flaked", "1/4 cup sofrito", "1 tomato, diced", "1 potato, cubed", "Adobo, sazón"],
+    steps: ["Soak codfish per package directions to remove excess salt, then simmer until tender and flake.", "Sauté sofrito and tomato.", "Add codfish and potato with a splash of water, simmer 15 min."] },
+  { id: "pr-d1", cuisine: "puerto-rican", slot: "dinner", name: "Arroz con Pollo", protein: 50, calories: 610, time: "45 min", proteinSources: ["chicken", "beans-legumes"],
+    ingredients: ["2 chicken thighs", "1 cup rice", "1/4 cup sofrito", "1/2 cup pigeon peas", "2 cups chicken broth", "Sazón, adobo"],
+    steps: ["Brown seasoned chicken, remove.", "Sauté sofrito, add rice, toast 1 min.", "Add broth, sazón, pigeon peas, and chicken back in.", "Cover, simmer 20 min until rice is done."] },
+  { id: "pr-d2", cuisine: "puerto-rican", slot: "dinner", name: "Habichuelas Guisadas Vegan con Tostones", protein: 24, calories: 440, time: "30 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups pink or red beans, cooked", "1/4 cup sofrito", "1 tbsp tomato sauce", "1 green plantain, sliced", "Adobo, sazón"],
+    steps: ["Fry plantain slices, smash flat, fry again until crisp.", "Sauté sofrito with tomato sauce, add beans and a splash of water.", "Simmer 15 min, season with adobo and sazón.", "Serve with tostones."] },
+  { id: "pr-d3", cuisine: "puerto-rican", slot: "dinner", name: "Carne Guisada (Beef Stew)", protein: 48, calories: 580, time: "55 min", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz beef stew meat, cubed", "1/4 cup sofrito", "1 potato, cubed", "1 carrot, sliced", "1 cup beef broth", "Adobo, sazón"],
+    steps: ["Season and brown beef.", "Add sofrito, cook 2 min.", "Add broth, potato, carrot, adobo, sazón; cover, simmer 35-40 min until tender."] },
+  { id: "pr-s1", cuisine: "puerto-rican", slot: "snack", name: "Queso Frito Bites", protein: 26, calories: 300, time: "10 min", proteinSources: ["dairy"],
+    ingredients: ["5 oz queso de freír, cubed", "1 tsp oil", "Adobo"],
+    steps: ["Heat oil in a pan.", "Fry cheese cubes until golden on all sides.", "Season lightly, serve warm."] },
+  { id: "pr-s2", cuisine: "puerto-rican", slot: "snack", name: "Huevos Duros con Adobo", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "Adobo seasoning", "Lime wedge"],
+    steps: ["Peel and halve eggs.", "Sprinkle with adobo, squeeze lime over top."] },
+  { id: "pr-s3", cuisine: "puerto-rican", slot: "snack", name: "Garbanzos Tostados con Adobo (Vegan)", protein: 12, calories: 170, time: "20 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1 cup cooked chickpeas, dried well", "1 tsp oil", "Adobo, garlic powder"],
+    steps: ["Toss chickpeas with oil and seasoning.", "Roast at 400°F, 18-20 min until crisp, shaking halfway."] },
+
+  // ================= CARIBBEAN =================
+  { id: "cb-b1", cuisine: "caribbean", slot: "breakfast", name: "Callaloo Scrambled Eggs", protein: 24, calories: 400, time: "15 min", proteinSources: ["eggs"],
+    ingredients: ["3 eggs", "1 cup callaloo or spinach, chopped", "1/2 onion, diced", "1/2 scotch bonnet (optional), minced", "Oil, salt"],
+    steps: ["Sauté onion and pepper until soft.", "Add greens, cook until wilted.", "Pour in beaten eggs, scramble until just set."] },
+  { id: "cb-b2", cuisine: "caribbean", slot: "breakfast", name: "Ackee-Style Eggs & Cheese", protein: 26, calories: 430, time: "15 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["3 eggs", "1/4 cup shredded cheese", "1/2 tomato, diced", "1/2 onion, diced", "Thyme, black pepper, oil"],
+    steps: ["Sauté onion, tomato, and thyme until soft.", "Add beaten eggs, scramble gently.", "Fold in cheese off heat until melted."] },
+  { id: "cb-b3", cuisine: "caribbean", slot: "breakfast", name: "Curried Tofu Scramble (Vegan)", protein: 22, calories: 370, time: "18 min", proteinSources: ["tofu"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1 tsp curry powder", "1/2 onion, diced", "1/2 tomato, diced", "Thyme"],
+    steps: ["Sauté onion and tomato with thyme.", "Add tofu and curry powder, cook 6-8 min until golden.", "Season with salt, serve with bread or rice."] },
+  { id: "cb-l1", cuisine: "caribbean", slot: "lunch", name: "Curry Chicken with Rice & Peas", protein: 64, calories: 660, time: "40 min", proteinSources: ["chicken", "beans-legumes"],
+    ingredients: ["8 oz chicken thigh, cubed", "1 cup cooked rice", "1/2 cup kidney beans, cooked", "1 tbsp curry powder", "1/2 onion", "Coconut milk splash"],
+    steps: ["Brown chicken with curry powder and onion.", "Add a splash of water or coconut milk, simmer 20 min.", "Warm rice with kidney beans stirred through.", "Serve curry over rice and peas."] },
+  { id: "cb-l2", cuisine: "caribbean", slot: "lunch", name: "Trini Stew Beans & Cheese", protein: 32, calories: 470, time: "25 min", proteinSources: ["beans-legumes", "dairy"],
+    ingredients: ["1.5 cups pigeon peas or kidney beans, cooked", "1/4 cup shredded cheese", "1/2 onion, diced", "1 tbsp tomato paste", "Thyme, garlic"],
+    steps: ["Sauté onion and garlic, add tomato paste and thyme.", "Add beans and a splash of water, simmer 15 min.", "Top with cheese until melted, serve."] },
+  { id: "cb-l3", cuisine: "caribbean", slot: "lunch", name: "Escovitch Fish", protein: 40, calories: 480, time: "30 min", proteinSources: ["fish-seafood"],
+    ingredients: ["2 white fish fillets (tilapia or snapper)", "1 bell pepper, sliced", "1/2 onion, sliced", "1/4 cup vinegar", "Scotch bonnet, allspice"],
+    steps: ["Season and pan-fry fish until crisp and cooked through.", "Simmer vinegar, pepper, onion, and allspice into a quick pickled topping.", "Spoon over fried fish, serve."] },
+  { id: "cb-d1", cuisine: "caribbean", slot: "dinner", name: "Jamaican Jerk Chicken with Rice & Peas", protein: 55, calories: 630, time: "45 min", proteinSources: ["chicken", "beans-legumes"],
+    ingredients: ["2 chicken thighs", "2 tbsp jerk seasoning", "1 cup rice", "1/2 cup kidney beans", "1/2 cup coconut milk"],
+    steps: ["Rub chicken with jerk seasoning, marinate 20+ min.", "Grill or bake at 400°F until cooked through, ~30 min.", "Cook rice with coconut milk and kidney beans stirred in.", "Serve together."] },
+  { id: "cb-d2", cuisine: "caribbean", slot: "dinner", name: "Curry Chickpeas with Rice & Peas (Vegan)", protein: 26, calories: 480, time: "30 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups chickpeas, cooked", "1 tbsp curry powder", "1/2 onion, diced", "1/2 cup coconut milk", "1 cup rice", "1/2 cup kidney beans"],
+    steps: ["Sauté onion with curry powder.", "Add chickpeas and coconut milk, simmer 15 min.", "Cook rice with kidney beans stirred through, serve alongside."] },
+  { id: "cb-d3", cuisine: "caribbean", slot: "dinner", name: "Stewed Beef (Caribbean-Style)", protein: 50, calories: 600, time: "55 min", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz beef stew meat", "1 onion, sliced", "2 tbsp browning sauce", "Thyme, garlic, allspice", "1 carrot, sliced"],
+    steps: ["Sear seasoned beef until browned.", "Add onion, garlic, thyme, allspice, browning sauce.", "Add a splash of water and carrot, cover, simmer 35-40 min until tender."] },
+  { id: "cb-s1", cuisine: "caribbean", slot: "snack", name: "Spiced Cheese Bites", protein: 15, calories: 210, time: "5 min", proteinSources: ["dairy"],
+    ingredients: ["2 oz cheese, cubed", "Pinch of scotch bonnet powder or hot sauce"],
+    steps: ["Cube cheese, toss lightly with hot sauce or pepper.", "Serve as-is."] },
+  { id: "cb-s2", cuisine: "caribbean", slot: "snack", name: "Boiled Eggs with Pepper Salt", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 boiled eggs", "Pinch of salt and scotch bonnet powder"],
+    steps: ["Peel eggs, halve.", "Sprinkle with seasoned salt, serve."] },
+  { id: "cb-s3", cuisine: "caribbean", slot: "snack", name: "Spiced Roasted Chickpeas (Vegan)", protein: 11, calories: 170, time: "20 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1 cup cooked chickpeas, dried well", "1 tsp oil", "Allspice, scotch bonnet powder"],
+    steps: ["Toss chickpeas with oil and spices.", "Roast at 400°F, 18-20 min until crisp, shaking halfway."] },
+
+  // ================= FRENCH =================
+  { id: "fr-b1", cuisine: "french", slot: "breakfast", name: "Omelette au Fromage", protein: 30, calories: 460, time: "10 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["3 eggs", "1/3 cup grated gruyère or cheddar", "1 tbsp butter", "Chives, salt, pepper"],
+    steps: ["Beat eggs with salt and pepper.", "Melt butter in a pan over medium-low heat, pour in eggs.", "As they set, sprinkle cheese over half.", "Fold omelette over, slide onto plate, top with chives."] },
+  { id: "fr-b2", cuisine: "french", slot: "breakfast", name: "Croque Madame", protein: 32, calories: 520, time: "15 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["1 egg", "2 slices bread", "2 slices plant or turkey ham (optional)", "2 tbsp grated gruyère", "1 tbsp butter", "1 tsp Dijon"],
+    steps: ["Spread Dijon on bread, layer cheese, toast until melted.", "Fry an egg sunny-side up in butter.", "Top the open sandwich with the fried egg."] },
+  { id: "fr-b3", cuisine: "french", slot: "breakfast", name: "Herbed Tofu Scramble with White Beans (Vegan)", protein: 24, calories: 390, time: "18 min", proteinSources: ["tofu", "beans-legumes"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1/2 cup white beans, cooked", "1 tbsp herbes de Provence", "1 shallot, diced", "Olive oil"],
+    steps: ["Sauté shallot in olive oil until soft.", "Add tofu and herbes de Provence, cook 6-8 min.", "Stir in white beans, warm through, season with salt."] },
+  { id: "fr-l1", cuisine: "french", slot: "lunch", name: "Poulet à la Provençale", protein: 50, calories: 560, time: "35 min", proteinSources: ["chicken"],
+    ingredients: ["2 chicken thighs", "1 cup diced tomatoes", "1 clove garlic", "Herbes de Provence", "Olive oil"],
+    steps: ["Sear seasoned chicken in olive oil until golden.", "Add garlic and tomatoes, scrape up browned bits.", "Sprinkle herbes de Provence, cover, simmer 20 min."] },
+  { id: "fr-l2", cuisine: "french", slot: "lunch", name: "Salade Niçoise-Style with Eggs & Beans", protein: 28, calories: 440, time: "20 min", proteinSources: ["eggs", "beans-legumes"],
+    ingredients: ["2 hard-boiled eggs, halved", "1 cup white beans, cooked", "Handful green beans, blanched", "Cherry tomatoes", "Olive oil, Dijon vinaigrette"],
+    steps: ["Arrange beans, green beans, and tomatoes on a plate.", "Top with halved eggs.", "Drizzle with olive oil and Dijon vinaigrette."] },
+  { id: "fr-l3", cuisine: "french", slot: "lunch", name: "Salmon with French Lentils", protein: 42, calories: 540, time: "30 min", proteinSources: ["fish-seafood", "beans-legumes"],
+    ingredients: ["6 oz salmon fillet", "1 cup cooked green lentils", "1 shallot, diced", "1 tsp Dijon", "Olive oil, lemon"],
+    steps: ["Pan-sear salmon skin-side down until crisp, flip, finish cooking.", "Sauté shallot, stir in lentils and Dijon.", "Plate lentils with salmon on top, squeeze lemon over."] },
+  { id: "fr-d1", cuisine: "french", slot: "dinner", name: "Chicken Chasseur", protein: 52, calories: 590, time: "40 min", proteinSources: ["chicken"],
+    ingredients: ["2 chicken thighs", "1 cup mushrooms, sliced", "1/2 onion, diced", "1/2 cup chicken broth", "1 tbsp tomato paste", "Thyme"],
+    steps: ["Brown chicken, set aside.", "Sauté onion and mushrooms until golden.", "Stir in tomato paste and broth, return chicken, simmer 20 min."] },
+  { id: "fr-d2", cuisine: "french", slot: "dinner", name: "French Lentil Stew (Vegan)", protein: 26, calories: 440, time: "35 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups green lentils, cooked", "1 carrot, diced", "1 celery stalk, diced", "1/2 onion, diced", "1 cup vegetable broth", "Thyme, bay leaf"],
+    steps: ["Sauté onion, carrot, and celery until soft.", "Add lentils, broth, thyme, and bay leaf.", "Simmer 20 min until thickened, season to taste."] },
+  { id: "fr-d3", cuisine: "french", slot: "dinner", name: "Beef Bourguignon-Style Stew", protein: 48, calories: 610, time: "60 min", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz beef chuck, cubed", "1 carrot, sliced", "1/2 onion, diced", "1 cup beef broth", "1 tbsp tomato paste", "Thyme, bay leaf"],
+    steps: ["Sear beef until browned, set aside.", "Sauté onion and carrot, stir in tomato paste.", "Return beef, add broth and herbs, cover, simmer 40 min until tender."] },
+  { id: "fr-s1", cuisine: "french", slot: "snack", name: "Gruyère & Cornichon Bites", protein: 28, calories: 320, time: "5 min", proteinSources: ["dairy"],
+    ingredients: ["4 oz gruyère, cubed", "Cornichons", "Whole grain crackers (optional)"],
+    steps: ["Plate cheese cubes with cornichons.", "Serve with crackers if desired."] },
+  { id: "fr-s2", cuisine: "french", slot: "snack", name: "Oeufs Mimosa", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "1 tsp mayo", "Chives, Dijon"],
+    steps: ["Halve eggs, mash yolks with mayo and a touch of Dijon.", "Refill whites, top with chives."] },
+  { id: "fr-s3", cuisine: "french", slot: "snack", name: "Marcona Almonds & Roasted Chickpeas (Vegan)", protein: 12, calories: 220, time: "5 min", proteinSources: ["nuts", "beans-legumes"],
+    ingredients: ["2 tbsp Marcona almonds", "1/2 cup roasted chickpeas", "Flaky salt"],
+    steps: ["Combine almonds and roasted chickpeas in a small bowl.", "Sprinkle with flaky salt, serve."] },
+
+  // ================= ITALIAN =================
+  { id: "it-b1", cuisine: "italian", slot: "breakfast", name: "Frittata al Formaggio", protein: 28, calories: 450, time: "20 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["3 eggs", "1/3 cup grated parmesan or mozzarella", "1/2 cup spinach", "1 tbsp olive oil", "Salt, pepper"],
+    steps: ["Whisk eggs with cheese, salt, pepper.", "Wilt spinach in olive oil in an oven-safe pan.", "Pour in eggs, cook 2 min on stovetop, then finish under broiler 3-4 min."] },
+  { id: "it-b2", cuisine: "italian", slot: "breakfast", name: "Uova in Purgatorio con Parmigiano", protein: 24, calories: 400, time: "20 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["3 eggs", "1 cup marinara or crushed tomatoes", "2 tbsp grated parmesan", "1 clove garlic", "Chili flake, basil"],
+    steps: ["Simmer garlic in a little oil, add tomatoes, season.", "Crack eggs into the sauce, cover, cook until whites set.", "Top with parmesan and basil."] },
+  { id: "it-b3", cuisine: "italian", slot: "breakfast", name: "Tofu Scramble al Pomodoro (Vegan)", protein: 20, calories: 340, time: "18 min", proteinSources: ["tofu"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1/2 cup crushed tomatoes", "1 clove garlic", "Basil, chili flake", "Olive oil"],
+    steps: ["Sauté garlic in olive oil, add crumbled tofu.", "Cook 5-6 min until golden, stir in crushed tomatoes.", "Simmer 5 min, finish with basil and chili flake."] },
+  { id: "it-l1", cuisine: "italian", slot: "lunch", name: "Chicken Piccata", protein: 48, calories: 520, time: "25 min", proteinSources: ["chicken"],
+    ingredients: ["6 oz chicken breast, pounded thin", "2 tbsp flour", "1/4 cup chicken broth", "1 lemon, juiced", "1 tbsp capers", "1 tbsp butter"],
+    steps: ["Dredge chicken in flour, pan-sear until golden, set aside.", "Deglaze with broth, lemon juice, and capers.", "Swirl in butter, return chicken to coat in sauce."] },
+  { id: "it-l2", cuisine: "italian", slot: "lunch", name: "Pasta e Fagioli with Parmesan", protein: 28, calories: 480, time: "25 min", proteinSources: ["beans-legumes", "dairy"],
+    ingredients: ["1.5 cups white beans, cooked", "1/2 cup small pasta, cooked", "1/4 cup grated parmesan", "1/2 onion, diced", "1 cup broth", "Rosemary"],
+    steps: ["Sauté onion, add beans, broth, and rosemary, simmer 10 min.", "Mash a few beans to thicken, stir in cooked pasta.", "Top with parmesan."] },
+  { id: "it-l3", cuisine: "italian", slot: "lunch", name: "Shrimp Scampi over White Beans", protein: 40, calories: 520, time: "20 min", proteinSources: ["fish-seafood", "beans-legumes"],
+    ingredients: ["8 oz shrimp, peeled", "1.5 cups white beans, cooked", "3 cloves garlic, sliced", "1/4 cup white wine or broth", "Lemon, parsley, butter"],
+    steps: ["Sauté garlic in butter, add shrimp, cook 2-3 min per side.", "Deglaze with wine or broth and lemon juice.", "Toss in warmed white beans, finish with parsley."] },
+  { id: "it-d1", cuisine: "italian", slot: "dinner", name: "Baked Chicken Parmesan (Lighter)", protein: 64, calories: 650, time: "35 min", proteinSources: ["chicken", "dairy"],
+    ingredients: ["8 oz chicken breast, pounded", "1/2 cup marinara", "1/3 cup shredded mozzarella", "2 tbsp breadcrumbs", "1 tbsp parmesan"],
+    steps: ["Coat chicken lightly in breadcrumbs and parmesan, bake at 400°F 15 min.", "Top with marinara and mozzarella, bake 10 min more until melted."] },
+  { id: "it-d2", cuisine: "italian", slot: "dinner", name: "Tofu Cacciatore (Vegan)", protein: 30, calories: 460, time: "35 min", proteinSources: ["tofu"],
+    ingredients: ["1 block firm tofu, cubed and pan-fried", "1 cup crushed tomatoes", "1/2 onion, diced", "1 bell pepper, sliced", "Oregano, garlic"],
+    steps: ["Pan-fry tofu cubes until golden, set aside.", "Sauté onion, pepper, garlic; add tomatoes and oregano.", "Return tofu, simmer 15 min to absorb the sauce."] },
+  { id: "it-d3", cuisine: "italian", slot: "dinner", name: "Beef Bolognese with Lentils", protein: 46, calories: 590, time: "40 min", proteinSources: ["beef-pork", "beans-legumes"],
+    ingredients: ["6 oz ground beef", "1/2 cup green lentils, cooked", "1 cup crushed tomatoes", "1/2 onion, diced", "Garlic, oregano, basil"],
+    steps: ["Brown beef with onion and garlic.", "Stir in lentils and crushed tomatoes, season with oregano and basil.", "Simmer 20 min, serve over pasta or on its own."] },
+  { id: "it-s1", cuisine: "italian", slot: "snack", name: "Caprese Bites", protein: 26, calories: 300, time: "5 min", proteinSources: ["dairy"],
+    ingredients: ["4 oz fresh mozzarella, cubed", "Cherry tomatoes", "Basil, balsamic drizzle"],
+    steps: ["Skewer or plate mozzarella with tomatoes and basil.", "Drizzle with balsamic."] },
+  { id: "it-s2", cuisine: "italian", slot: "snack", name: "Parmesan-Crisped Eggs", protein: 14, calories: 190, time: "10 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["2 eggs", "2 tbsp grated parmesan", "Black pepper"],
+    steps: ["Fry eggs, sprinkling parmesan into the pan around the whites so it crisps.", "Season with pepper, serve."] },
+  { id: "it-s3", cuisine: "italian", slot: "snack", name: "Marinated White Beans & Olives (Vegan)", protein: 10, calories: 190, time: "5 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1/2 cup white beans, cooked", "Handful olives", "Olive oil, lemon zest, oregano"],
+    steps: ["Toss beans and olives with olive oil, lemon zest, and oregano.", "Let sit 10 min for flavors to meld, serve."] },
+
+  // ================= MEXICAN =================
+  { id: "mx-b1", cuisine: "mexican", slot: "breakfast", name: "Huevos Rancheros with Black Beans & Cheese", protein: 40, calories: 560, time: "20 min", proteinSources: ["eggs", "beans-legumes", "dairy"],
+    ingredients: ["4 eggs", "1 cup black beans, cooked", "1/3 cup shredded cheese", "1/4 cup salsa", "1 corn tortilla", "Cilantro"],
+    steps: ["Warm black beans with a splash of salsa.", "Fry or poach eggs to your liking.", "Warm tortilla, layer beans, top with eggs, cheese, and salsa.", "Finish with cilantro."] },
+  { id: "mx-b2", cuisine: "mexican", slot: "breakfast", name: "Egg & Black Bean Migas with Cheese", protein: 32, calories: 500, time: "20 min", proteinSources: ["eggs", "beans-legumes", "dairy"],
+    ingredients: ["3 eggs", "1 cup black beans, cooked", "1/4 cup shredded cheese", "1 corn tortilla, torn and crisped", "1/2 onion, diced", "Salsa"],
+    steps: ["Crisp torn tortilla pieces in a dry pan, set aside.", "Sauté onion, add beans to warm through.", "Scramble in eggs, fold in crisped tortilla and cheese at the end.", "Top with salsa."] },
+  { id: "mx-b3", cuisine: "mexican", slot: "breakfast", name: "Tofu Migas (Vegan)", protein: 26, calories: 420, time: "20 min", proteinSources: ["tofu", "beans-legumes"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1/2 cup black beans, cooked", "1 corn tortilla, torn and crisped", "1/2 tsp turmeric", "1/2 onion, diced", "Salsa"],
+    steps: ["Crisp torn tortilla pieces in a dry pan, set aside.", "Sauté onion, add crumbled tofu and turmeric, cook 6-8 min.", "Stir in beans and crisped tortilla, warm through.", "Top with salsa."] },
+  { id: "mx-l1", cuisine: "mexican", slot: "lunch", name: "Chicken Tinga Tacos", protein: 60, calories: 610, time: "30 min", proteinSources: ["chicken"],
+    ingredients: ["8 oz cooked chicken breast, shredded", "1/2 cup tomato-chipotle sauce", "1/2 onion, sliced", "3 corn tortillas", "Cilantro, lime"],
+    steps: ["Simmer shredded chicken in tomato-chipotle sauce with onion, 10 min.", "Warm tortillas.", "Build tacos with chicken, cilantro, and a squeeze of lime."] },
+  { id: "mx-l2", cuisine: "mexican", slot: "lunch", name: "Black Bean & Cheese Tostadas", protein: 30, calories: 480, time: "20 min", proteinSources: ["beans-legumes", "dairy"],
+    ingredients: ["1.5 cups black beans, cooked", "1/3 cup shredded cheese", "2 tostada shells", "1/2 avocado", "Salsa, lime"],
+    steps: ["Mash black beans, warm through with a splash of water.", "Spread onto tostada shells, top with cheese.", "Broil 2-3 min until cheese melts, top with avocado and salsa."] },
+  { id: "mx-l3", cuisine: "mexican", slot: "lunch", name: "Shrimp Ceviche Tostadas", protein: 38, calories: 460, time: "25 min (plus marinate)", proteinSources: ["fish-seafood"],
+    ingredients: ["8 oz shrimp, cooked and chopped", "1/4 cup lime juice", "1/2 tomato, diced", "1/4 onion, diced", "Cilantro", "2 tostada shells"],
+    steps: ["Toss shrimp with lime juice, tomato, onion, and cilantro.", "Marinate 15 min in the fridge.", "Spoon onto tostada shells to serve."] },
+  { id: "mx-d1", cuisine: "mexican", slot: "dinner", name: "Chicken Tinga Enchiladas", protein: 55, calories: 620, time: "40 min", proteinSources: ["chicken", "dairy"],
+    ingredients: ["6 oz cooked chicken breast, shredded", "1/2 cup tomato-chipotle sauce", "1/3 cup shredded cheese", "3 corn tortillas", "Onion, cilantro"],
+    steps: ["Simmer shredded chicken in chipotle sauce.", "Roll into tortillas, place in a baking dish.", "Top with remaining sauce and cheese, bake at 400°F 15 min until bubbling."] },
+  { id: "mx-d2", cuisine: "mexican", slot: "dinner", name: "Carne Asada", protein: 50, calories: 580, time: "30 min (plus marinate)", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz flank steak", "2 limes, juiced", "2 cloves garlic, minced", "Cumin, chili powder", "Cilantro"],
+    steps: ["Marinate steak in lime juice, garlic, and spices 20+ min.", "Grill or pan-sear 4-5 min per side to desired doneness.", "Rest 5 min, slice against the grain, top with cilantro."] },
+  { id: "mx-d3", cuisine: "mexican", slot: "dinner", name: "Vegan Black Bean & Tofu Chili", protein: 30, calories: 480, time: "35 min", proteinSources: ["beans-legumes", "tofu"],
+    ingredients: ["1 block firm tofu, cubed", "1.5 cups black beans, cooked", "1 cup crushed tomatoes", "1/2 onion, diced", "Chili powder, cumin, garlic"],
+    steps: ["Pan-fry tofu cubes until golden.", "Sauté onion and garlic with chili powder and cumin.", "Add tomatoes, beans, and tofu, simmer 20 min."] },
+  { id: "mx-s1", cuisine: "mexican", slot: "snack", name: "Elote-Style Cheese Bites", protein: 14, calories: 220, time: "10 min", proteinSources: ["dairy"],
+    ingredients: ["1/2 cup corn kernels", "2 tbsp cotija or feta, crumbled", "1 tbsp mayo", "Chili powder, lime"],
+    steps: ["Char corn in a dry pan 5 min.", "Toss with mayo, cheese, chili powder, and a squeeze of lime."] },
+  { id: "mx-s2", cuisine: "mexican", slot: "snack", name: "Roasted Pepitas & Black Beans (Vegan)", protein: 14, calories: 200, time: "20 min", proteinSources: ["nuts", "beans-legumes"],
+    ingredients: ["1/4 cup pepitas", "1/2 cup black beans, cooked, dried well", "Chili powder, lime zest", "1 tsp oil"],
+    steps: ["Toss beans and pepitas with oil and chili powder.", "Roast at 400°F, 15-18 min until beans are crisp, shaking halfway.", "Finish with lime zest."] },
+  { id: "mx-s3", cuisine: "mexican", slot: "snack", name: "Deviled Eggs con Chile", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "1 tsp mayo", "Pinch chili powder", "Cilantro, lime"],
+    steps: ["Halve eggs, mash yolks with mayo and chili powder.", "Refill whites, top with cilantro and a squeeze of lime."] },
+
+  // ================= INDIAN =================
+  { id: "in-b1", cuisine: "indian", slot: "breakfast", name: "Masala Egg Bhurji with Paneer", protein: 38, calories: 500, time: "18 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["4 eggs", "1/2 cup paneer, cubed", "1/2 onion, diced", "1/2 tomato, diced", "Turmeric, cumin, garam masala"],
+    steps: ["Sauté onion and tomato with turmeric and cumin.", "Add paneer, warm through.", "Pour in beaten eggs, scramble until just set, finish with garam masala."] },
+  { id: "in-b2", cuisine: "indian", slot: "breakfast", name: "Chana Masala Breakfast Bowl (Vegan)", protein: 24, calories: 420, time: "20 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups chickpeas, cooked", "1/2 onion, diced", "1/2 cup crushed tomatoes", "Cumin, garam masala, ginger"],
+    steps: ["Sauté onion and ginger with cumin.", "Add tomatoes and chickpeas, simmer 12-15 min.", "Finish with garam masala, serve warm."] },
+  { id: "in-b3", cuisine: "indian", slot: "breakfast", name: "Tofu Bhurji (Vegan)", protein: 22, calories: 370, time: "18 min", proteinSources: ["tofu"],
+    ingredients: ["1/2 block firm tofu, crumbled", "1/2 onion, diced", "1/2 tomato, diced", "Turmeric, cumin, ginger"],
+    steps: ["Sauté onion, tomato, and ginger with turmeric and cumin.", "Add crumbled tofu, cook 6-8 min until golden.", "Season with salt, serve with toast or roti."] },
+  { id: "in-l1", cuisine: "indian", slot: "lunch", name: "Butter Chicken with Rice", protein: 62, calories: 670, time: "35 min", proteinSources: ["chicken", "dairy"],
+    ingredients: ["8 oz chicken thigh, cubed", "1/2 cup tomato sauce", "2 tbsp yogurt or cream", "1 cup cooked rice", "Garam masala, ginger, garlic"],
+    steps: ["Marinate chicken in yogurt and spices 15+ min if time allows.", "Sear chicken, add tomato sauce, simmer 15 min.", "Stir in cream, serve over rice."] },
+  { id: "in-l2", cuisine: "indian", slot: "lunch", name: "Chana Masala with Rice", protein: 28, calories: 500, time: "25 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups chickpeas, cooked", "1 cup cooked rice", "1/2 onion, diced", "1/2 cup crushed tomatoes", "Cumin, garam masala, ginger"],
+    steps: ["Sauté onion and ginger with cumin.", "Add tomatoes and chickpeas, simmer 15 min.", "Finish with garam masala, serve over rice."] },
+  { id: "in-l3", cuisine: "indian", slot: "lunch", name: "Paneer Tikka Masala", protein: 34, calories: 540, time: "30 min", proteinSources: ["dairy"],
+    ingredients: ["6 oz paneer, cubed", "1/2 cup tomato sauce", "2 tbsp yogurt", "Garam masala, cumin, ginger, garlic"],
+    steps: ["Pan-sear paneer cubes until golden, set aside.", "Sauté ginger and garlic, add tomato sauce and spices, simmer 10 min.", "Stir in yogurt and paneer, warm through."] },
+  { id: "in-d1", cuisine: "indian", slot: "dinner", name: "Tandoori Chicken with Dal", protein: 68, calories: 660, time: "40 min (plus marinate)", proteinSources: ["chicken", "beans-legumes"],
+    ingredients: ["3 chicken thighs", "1/4 cup yogurt", "1 tbsp tandoori spice blend", "1 cup lentils, cooked", "Garlic, ginger"],
+    steps: ["Marinate chicken in yogurt and tandoori spices 20+ min.", "Bake or grill chicken at 425°F, 25 min until charred and cooked through.", "Warm lentils with garlic and ginger, serve alongside."] },
+  { id: "in-d2", cuisine: "indian", slot: "dinner", name: "Rajma (Kidney Bean Curry) with Rice (Vegan)", protein: 28, calories: 520, time: "30 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups kidney beans, cooked", "1 cup cooked rice", "1/2 onion, diced", "1/2 cup crushed tomatoes", "Cumin, garam masala, ginger"],
+    steps: ["Sauté onion and ginger with cumin.", "Add tomatoes and kidney beans, simmer 15-20 min, mashing a few beans to thicken.", "Finish with garam masala, serve over rice."] },
+  { id: "in-d3", cuisine: "indian", slot: "dinner", name: "Beef Curry", protein: 48, calories: 590, time: "50 min", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz beef stew meat, cubed", "1/2 onion, diced", "1/2 cup crushed tomatoes", "Coconut milk splash", "Curry powder, garam masala, ginger, garlic"],
+    steps: ["Sear seasoned beef, set aside.", "Sauté onion, ginger, garlic with curry powder.", "Add tomatoes, coconut milk, and beef, cover, simmer 30-35 min until tender."] },
+  { id: "in-s1", cuisine: "indian", slot: "snack", name: "Roasted Chickpea Chaat (Vegan)", protein: 14, calories: 200, time: "20 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1 cup chickpeas, cooked, dried well", "1 tsp oil", "Chaat masala, lime"],
+    steps: ["Toss chickpeas with oil and chaat masala.", "Roast at 400°F, 18-20 min until crisp.", "Finish with a squeeze of lime."] },
+  { id: "in-s2", cuisine: "indian", slot: "snack", name: "Paneer Tikka Bites", protein: 28, calories: 320, time: "15 min", proteinSources: ["dairy"],
+    ingredients: ["5 oz paneer, cubed", "1 tbsp yogurt", "Tandoori spice blend", "1 tsp oil"],
+    steps: ["Toss paneer cubes with yogurt and tandoori spice.", "Pan-sear 4-5 min until lightly charred on all sides."] },
+  { id: "in-s3", cuisine: "indian", slot: "snack", name: "Spiced Boiled Eggs", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "Chaat masala", "Lime wedge"],
+    steps: ["Halve eggs, sprinkle with chaat masala.", "Serve with a squeeze of lime."] },
+
+  // ================= CHINESE =================
+  { id: "cn-b1", cuisine: "chinese", slot: "breakfast", name: "Egg & Tofu Congee", protein: 26, calories: 420, time: "25 min", proteinSources: ["eggs", "tofu"],
+    ingredients: ["2 eggs", "1/2 block soft tofu, cubed", "1/2 cup cooked rice", "2 cups broth", "Scallion, soy sauce, ginger"],
+    steps: ["Simmer rice in broth with ginger until porridge-like, about 15 min.", "Stir in tofu, warm through.", "Crack in eggs, stir gently until just set, finish with scallion and soy sauce."] },
+  { id: "cn-b2", cuisine: "chinese", slot: "breakfast", name: "Scrambled Eggs with Shrimp", protein: 30, calories: 420, time: "15 min", proteinSources: ["eggs", "fish-seafood"],
+    ingredients: ["3 eggs", "4 oz shrimp, chopped", "1 scallion, sliced", "Soy sauce, sesame oil", "Oil"],
+    steps: ["Sear shrimp 2 min until just pink, set aside.", "Scramble eggs in the same pan.", "Fold shrimp back in, finish with soy sauce, sesame oil, and scallion."] },
+  { id: "cn-b3", cuisine: "chinese", slot: "breakfast", name: "Silken Tofu with Soy & Scallion (Vegan)", protein: 20, calories: 280, time: "10 min", proteinSources: ["tofu"],
+    ingredients: ["1 block silken tofu", "1 scallion, sliced", "Soy sauce, sesame oil, chili crisp (optional)"],
+    steps: ["Slice tofu onto a plate.", "Drizzle with soy sauce and sesame oil.", "Top with scallion and chili crisp if using."] },
+  { id: "cn-l1", cuisine: "chinese", slot: "lunch", name: "Kung Pao Chicken", protein: 60, calories: 620, time: "25 min", proteinSources: ["chicken", "nuts"],
+    ingredients: ["8 oz chicken thigh, cubed", "2 tbsp peanuts", "1 bell pepper, diced", "Soy sauce, rice vinegar, chili paste, garlic"],
+    steps: ["Stir-fry chicken until cooked through, set aside.", "Stir-fry pepper and garlic 2 min.", "Return chicken, add soy sauce, vinegar, and chili paste, toss with peanuts."] },
+  { id: "cn-l2", cuisine: "chinese", slot: "lunch", name: "Mapo Tofu (Vegan)", protein: 28, calories: 460, time: "20 min", proteinSources: ["tofu", "beans-legumes"],
+    ingredients: ["1 block firm tofu, cubed", "2 tbsp fermented bean paste (doubanjiang)", "1 scallion, sliced", "Garlic, ginger", "Chili oil"],
+    steps: ["Sauté garlic, ginger, and bean paste until fragrant.", "Add a splash of water and tofu cubes, simmer 8-10 min.", "Finish with scallion and chili oil."] },
+  { id: "cn-l3", cuisine: "chinese", slot: "lunch", name: "Beef & Broccoli", protein: 46, calories: 540, time: "25 min", proteinSources: ["beef-pork"],
+    ingredients: ["6 oz flank steak, sliced thin", "2 cups broccoli florets", "Soy sauce, oyster sauce, garlic, ginger", "1 tsp cornstarch"],
+    steps: ["Toss beef with a little cornstarch and soy sauce.", "Sear beef until browned, set aside.", "Stir-fry broccoli with garlic and ginger, return beef, add oyster sauce, toss to coat."] },
+  { id: "cn-d1", cuisine: "chinese", slot: "dinner", name: "Baked General Tso's-Style Chicken", protein: 52, calories: 600, time: "35 min", proteinSources: ["chicken"],
+    ingredients: ["8 oz chicken thigh, cubed", "2 tbsp cornstarch", "Soy sauce, rice vinegar, garlic, ginger", "1 tbsp honey or brown sugar"],
+    steps: ["Toss chicken in cornstarch, bake at 425°F, 18-20 min until crisp.", "Simmer soy sauce, vinegar, garlic, ginger, and honey into a glaze.", "Toss baked chicken in the glaze."] },
+  { id: "cn-d2", cuisine: "chinese", slot: "dinner", name: "Shrimp & Vegetable Stir-Fry", protein: 40, calories: 480, time: "20 min", proteinSources: ["fish-seafood"],
+    ingredients: ["8 oz shrimp, peeled", "2 cups mixed vegetables (snap peas, carrots, peppers)", "Soy sauce, garlic, ginger", "1 tsp sesame oil"],
+    steps: ["Stir-fry shrimp 2-3 min until pink, set aside.", "Stir-fry vegetables with garlic and ginger 4-5 min.", "Return shrimp, add soy sauce and sesame oil, toss to combine."] },
+  { id: "cn-d3", cuisine: "chinese", slot: "dinner", name: "Braised Tofu & Mushroom (Vegan)", protein: 30, calories: 440, time: "30 min", proteinSources: ["tofu"],
+    ingredients: ["1 block firm tofu, cubed", "1 cup mushrooms, sliced", "Soy sauce, ginger, garlic", "1 cup broth", "Scallion"],
+    steps: ["Pan-fry tofu cubes until golden, set aside.", "Sauté mushrooms, garlic, and ginger.", "Add broth and soy sauce, return tofu, simmer 12-15 min, finish with scallion."] },
+  { id: "cn-s1", cuisine: "chinese", slot: "snack", name: "Edamame with Sea Salt (Vegan)", protein: 28, calories: 260, time: "8 min", proteinSources: ["beans-legumes"],
+    ingredients: ["2.5 cups edamame in pods", "Sea salt"],
+    steps: ["Steam or boil edamame 5 min.", "Toss with sea salt, serve warm."] },
+  { id: "cn-s2", cuisine: "chinese", slot: "snack", name: "Five-Spice Roasted Cashews (Vegan)", protein: 12, calories: 210, time: "15 min", proteinSources: ["nuts"],
+    ingredients: ["1/3 cup raw cashews", "1/2 tsp five-spice powder", "1 tsp oil"],
+    steps: ["Toss cashews with oil and five-spice powder.", "Roast at 350°F, 8-10 min, shaking halfway."] },
+  { id: "cn-s3", cuisine: "chinese", slot: "snack", name: "Tea Eggs", protein: 12, calories: 160, time: "10 min (plus steep)", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs, shells cracked", "1 cup brewed black tea", "Soy sauce, star anise"],
+    steps: ["Simmer cracked eggs in tea, soy sauce, and star anise 20-30 min.", "Cool and peel for a marbled look, serve."] },
+
+  // ================= MEDITERRANEAN =================
+  { id: "md-b1", cuisine: "mediterranean", slot: "breakfast", name: "Greek Yogurt with Walnuts & Honey", protein: 22, calories: 380, time: "5 min", proteinSources: ["dairy", "nuts"],
+    ingredients: ["1 cup Greek yogurt", "2 tbsp walnuts, chopped", "1 tbsp honey", "Cinnamon"],
+    steps: ["Spoon yogurt into a bowl.", "Top with walnuts, honey, and a dash of cinnamon."] },
+  { id: "md-b2", cuisine: "mediterranean", slot: "breakfast", name: "Shakshuka with Feta", protein: 36, calories: 480, time: "25 min", proteinSources: ["eggs", "dairy"],
+    ingredients: ["4 eggs", "1 cup crushed tomatoes", "1/3 cup crumbled feta", "1/2 onion, diced", "Cumin, paprika, garlic"],
+    steps: ["Sauté onion and garlic with cumin and paprika.", "Add tomatoes, simmer 8-10 min.", "Crack eggs into the sauce, cover, cook until whites set, top with feta."] },
+  { id: "md-b3", cuisine: "mediterranean", slot: "breakfast", name: "Chickpea & Spinach Scramble (Vegan)", protein: 22, calories: 380, time: "18 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1 cup chickpeas, cooked", "1 cup spinach", "1/2 onion, diced", "Cumin, smoked paprika, garlic"],
+    steps: ["Sauté onion and garlic with cumin and paprika.", "Add chickpeas, lightly mash some for texture, warm through.", "Fold in spinach until wilted."] },
+  { id: "md-l1", cuisine: "mediterranean", slot: "lunch", name: "Grilled Chicken Souvlaki", protein: 48, calories: 540, time: "30 min (plus marinate)", proteinSources: ["chicken"],
+    ingredients: ["6 oz chicken breast, cubed", "1 lemon, juiced", "2 tbsp olive oil", "Oregano, garlic", "Pita (optional)"],
+    steps: ["Marinate chicken in lemon, olive oil, oregano, and garlic 20+ min.", "Skewer and grill or pan-sear until cooked through, 10-12 min.", "Serve with pita if desired."] },
+  { id: "md-l2", cuisine: "mediterranean", slot: "lunch", name: "Falafel with Hummus Bowl (Vegan)", protein: 26, calories: 480, time: "30 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1.5 cups chickpeas, cooked", "1/4 cup hummus", "Cumin, coriander, garlic, parsley", "1 tbsp flour", "Oil for pan-frying"],
+    steps: ["Pulse chickpeas with spices, garlic, parsley, and flour into a coarse mixture.", "Form into small patties, pan-fry 3-4 min per side until golden.", "Serve over a bowl with hummus."] },
+  { id: "md-l3", cuisine: "mediterranean", slot: "lunch", name: "Greek Salad with Grilled Chicken & Feta", protein: 46, calories: 500, time: "25 min", proteinSources: ["chicken", "dairy"],
+    ingredients: ["6 oz grilled chicken breast, sliced", "1/4 cup crumbled feta", "Cucumber, tomato, red onion, olives", "Olive oil, oregano, lemon"],
+    steps: ["Grill or pan-sear seasoned chicken until cooked through, slice.", "Toss cucumber, tomato, onion, and olives with olive oil and lemon.", "Top salad with chicken and feta."] },
+  { id: "md-d1", cuisine: "mediterranean", slot: "dinner", name: "Lemon Herb Chicken with White Beans", protein: 66, calories: 650, time: "40 min", proteinSources: ["chicken", "beans-legumes"],
+    ingredients: ["3 chicken thighs", "1.5 cups white beans, cooked", "1 lemon, juiced", "Oregano, garlic, olive oil"],
+    steps: ["Sear seasoned chicken until golden, finish in the oven at 400°F, 20 min.", "Warm white beans with garlic, lemon juice, and oregano.", "Plate chicken over beans."] },
+  { id: "md-d2", cuisine: "mediterranean", slot: "dinner", name: "Baked Salmon with Lentils", protein: 46, calories: 560, time: "30 min", proteinSources: ["fish-seafood", "beans-legumes"],
+    ingredients: ["6 oz salmon fillet", "1 cup lentils, cooked", "1 shallot, diced", "Lemon, dill, olive oil"],
+    steps: ["Bake salmon at 400°F, 12-15 min until flaky.", "Sauté shallot, stir in lentils and lemon juice.", "Plate lentils with salmon on top, finish with dill."] },
+  { id: "md-d3", cuisine: "mediterranean", slot: "dinner", name: "Stuffed Eggplant with Chickpeas (Vegan)", protein: 26, calories: 460, time: "45 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1 large eggplant, halved", "1.5 cups chickpeas, cooked", "1/2 cup crushed tomatoes", "Cumin, paprika, garlic", "Parsley"],
+    steps: ["Roast eggplant halves at 400°F, 20 min until soft, scoop out some flesh.", "Sauté garlic with cumin and paprika, add tomatoes and chickpeas, simmer 10 min.", "Stuff mixture into eggplant halves, bake 10 min more, top with parsley."] },
+  { id: "md-s1", cuisine: "mediterranean", slot: "snack", name: "Hummus & Cucumber (Vegan)", protein: 10, calories: 180, time: "5 min", proteinSources: ["beans-legumes"],
+    ingredients: ["1/3 cup hummus", "1 cucumber, sliced"],
+    steps: ["Serve hummus with cucumber slices for dipping."] },
+  { id: "md-s2", cuisine: "mediterranean", slot: "snack", name: "Marinated Feta & Olives", protein: 26, calories: 320, time: "5 min", proteinSources: ["dairy"],
+    ingredients: ["4 oz feta, cubed", "Handful olives", "Olive oil, oregano, lemon zest"],
+    steps: ["Toss feta and olives with olive oil, oregano, and lemon zest.", "Let sit 10 min, serve."] },
+  { id: "md-s3", cuisine: "mediterranean", slot: "snack", name: "Spiced Roasted Almonds (Vegan)", protein: 10, calories: 200, time: "15 min", proteinSources: ["nuts"],
+    ingredients: ["1/3 cup raw almonds", "1 tsp oil", "Smoked paprika, cumin, salt"],
+    steps: ["Toss almonds with oil and spices.", "Roast at 350°F, 10 min, shaking halfway."] },
+
+  // ================= THAI =================
+  { id: "th-b1", cuisine: "thai", slot: "breakfast", name: "Thai-Style Egg & Tofu Scramble", protein: 26, calories: 400, time: "15 min", proteinSources: ["eggs", "tofu"],
+    ingredients: ["2 eggs", "1/3 block firm tofu, crumbled", "1 scallion, sliced", "Soy sauce, white pepper", "Oil"],
+    steps: ["Sauté crumbled tofu until lightly golden.", "Push to one side, scramble in eggs.", "Combine, season with soy sauce and white pepper, top with scallion."] },
+  { id: "th-b2", cuisine: "thai", slot: "breakfast", name: "Coconut Egg Curry", protein: 24, calories: 420, time: "20 min", proteinSources: ["eggs"],
+    ingredients: ["3 eggs, hard-boiled", "1/2 cup coconut milk", "1 tbsp curry paste", "1/2 onion, diced"],
+    steps: ["Sauté onion with curry paste until fragrant.", "Add coconut milk, simmer 5 min.", "Add hard-boiled eggs, halved, simmer 5 min more to absorb the sauce."] },
+  { id: "th-b3", cuisine: "thai", slot: "breakfast", name: "Tofu Jok (Rice Porridge, Vegan)", protein: 20, calories: 340, time: "25 min", proteinSources: ["tofu"],
+    ingredients: ["1/2 block soft tofu, cubed", "1/2 cup cooked rice", "2 cups vegetable broth", "Ginger, scallion, soy sauce"],
+    steps: ["Simmer rice in broth with ginger until porridge-like, 15 min.", "Add tofu, warm through.", "Finish with soy sauce and scallion."] },
+  { id: "th-l1", cuisine: "thai", slot: "lunch", name: "Thai Basil Chicken (Pad Krapow)", protein: 48, calories: 540, time: "20 min", proteinSources: ["chicken"],
+    ingredients: ["6 oz ground chicken", "1 cup Thai basil leaves", "2 cloves garlic, minced", "Fish sauce, soy sauce, chili"],
+    steps: ["Sauté garlic and chili until fragrant.", "Add ground chicken, cook until browned.", "Season with fish sauce and soy sauce, fold in basil off heat."] },
+  { id: "th-l2", cuisine: "thai", slot: "lunch", name: "Tofu Green Curry (Vegan)", protein: 26, calories: 460, time: "25 min", proteinSources: ["tofu"],
+    ingredients: ["1 block firm tofu, cubed", "1/2 cup coconut milk", "1 tbsp green curry paste", "Bell pepper, basil"],
+    steps: ["Pan-fry tofu cubes until golden, set aside.", "Sauté curry paste in a little coconut milk until fragrant.", "Add remaining coconut milk and pepper, simmer 8 min, return tofu, finish with basil."] },
+  { id: "th-l3", cuisine: "thai", slot: "lunch", name: "Shrimp Pad Thai", protein: 40, calories: 560, time: "25 min", proteinSources: ["fish-seafood", "eggs"],
+    ingredients: ["8 oz shrimp, peeled", "1 egg", "4 oz rice noodles", "Tamarind paste, fish sauce, sugar", "Bean sprouts, peanuts, lime"],
+    steps: ["Soak rice noodles per package directions.", "Stir-fry shrimp until pink, push aside, scramble in egg.", "Add noodles and sauce (tamarind, fish sauce, sugar), toss to combine, top with sprouts, peanuts, and lime."] },
+  { id: "th-d1", cuisine: "thai", slot: "dinner", name: "Massaman Beef Curry", protein: 48, calories: 600, time: "55 min", proteinSources: ["beef-pork"],
+    ingredients: ["8 oz beef stew meat, cubed", "1/2 cup coconut milk", "2 tbsp massaman curry paste", "1 potato, cubed", "Peanuts"],
+    steps: ["Sear beef, set aside.", "Sauté curry paste in a little coconut milk until fragrant.", "Add remaining coconut milk, beef, and potato, cover, simmer 35-40 min, top with peanuts."] },
+  { id: "th-d2", cuisine: "thai", slot: "dinner", name: "Thai Peanut Chicken", protein: 52, calories: 610, time: "30 min", proteinSources: ["chicken", "nuts"],
+    ingredients: ["8 oz chicken thigh, cubed", "3 tbsp peanut butter", "1/4 cup coconut milk", "Soy sauce, lime, garlic, chili"],
+    steps: ["Sear chicken until cooked through.", "Whisk peanut butter, coconut milk, soy sauce, lime, garlic, and chili into a sauce.", "Toss chicken in the sauce, simmer 5 min to thicken."] },
+  { id: "th-d3", cuisine: "thai", slot: "dinner", name: "Tofu & Vegetable Red Curry (Vegan)", protein: 30, calories: 480, time: "30 min", proteinSources: ["tofu"],
+    ingredients: ["1 block firm tofu, cubed", "1/2 cup coconut milk", "1 tbsp red curry paste", "Bell pepper, bamboo shoots, basil"],
+    steps: ["Pan-fry tofu cubes until golden, set aside.", "Sauté curry paste in a little coconut milk until fragrant.", "Add remaining coconut milk and vegetables, simmer 10 min, return tofu, finish with basil."] },
+  { id: "th-s1", cuisine: "thai", slot: "snack", name: "Thai Peanut-Roasted Chickpeas (Vegan)", protein: 14, calories: 210, time: "20 min", proteinSources: ["beans-legumes", "nuts"],
+    ingredients: ["1 cup chickpeas, cooked, dried well", "1 tbsp peanut butter, warmed", "Soy sauce, lime"],
+    steps: ["Toss chickpeas with a thinned peanut butter-soy glaze.", "Roast at 400°F, 18-20 min until crisp.", "Finish with a squeeze of lime."] },
+  { id: "th-s2", cuisine: "thai", slot: "snack", name: "Coconut-Lime Edamame (Vegan)", protein: 26, calories: 250, time: "10 min", proteinSources: ["beans-legumes"],
+    ingredients: ["2.5 cups edamame in pods", "1 tsp coconut oil", "Lime zest, chili flake, sea salt"],
+    steps: ["Steam edamame 5 min.", "Toss with coconut oil, lime zest, chili flake, and sea salt."] },
+  { id: "th-s3", cuisine: "thai", slot: "snack", name: "Spiced Hard-Boiled Eggs", protein: 12, calories: 160, time: "10 min", proteinSources: ["eggs"],
+    ingredients: ["2 hard-boiled eggs", "Chili powder, salt", "Lime wedge"],
+    steps: ["Halve eggs, sprinkle with chili powder and salt.", "Serve with a squeeze of lime."] },
+];
+
+// Fitelations already has `today()` (no-arg, today's date as YYYY-MM-DD).
+// This variant accepts an arbitrary date, needed to compute each day of the week.
+const dateKeyOf = (d) => d.toISOString().slice(0, 10);
+
+// Maps DAYS[0..6] (Sunday..Saturday) to the actual calendar date string for
+// *this* week, so "Saturday" in the week view always means a specific date —
+// never a generic weekday that silently aliases onto whichever date the log
+// happens to be keyed by.
+function getWeekDateKeys(d = new Date()) {
+  const dow = d.getDay(); // 0 = Sunday
+  const sunday = new Date(d);
+  sunday.setDate(d.getDate() - dow);
+  return DAYS.map((_, i) => {
+    const dt = new Date(sunday);
+    dt.setDate(sunday.getDate() + i);
+    return dateKeyOf(dt);
+  });
+}
+
+function isoWeekNumber(d = new Date()) {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  return Math.ceil((((date - yearStart) / 86400000) + 1) / 7) + date.getUTCFullYear() * 100;
+}
+
+function seededRandom(seedStr) {
+  let h = 1779033703 ^ seedStr.length;
+  for (let i = 0; i < seedStr.length; i++) {
+    h = Math.imul(h ^ seedStr.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function () {
+    h = Math.imul(h ^ (h >>> 16), 2246822519);
+    h = Math.imul(h ^ (h >>> 13), 3266489917);
+    h = (h ^= h >>> 16) >>> 0;
+    return h / 4294967296;
+  };
+}
+
+function matchesSources(recipe, allowedSources) {
+  return recipe.proteinSources.every((s) => allowedSources.includes(s));
+}
+
+function parseMinutes(timeStr) {
+  const match = /(\d+)/.exec(timeStr || "");
+  return match ? parseInt(match[1], 10) : 999;
+}
+
+function matchesTime(recipe, maxPrepTime) {
+  return maxPrepTime == null || parseMinutes(recipe.time) <= maxPrepTime;
+}
+
+// Builds the candidate pool for one slot. Tries the full filter set first
+// (cuisine + protein sources + prep time + not-banned), then relaxes filters
+// one at a time — cuisine first, then prep time, then bans — so a slot is
+// never left empty. Protein sources are never relaxed (dietary constraint).
+function getPoolForSlot(slotId, cuisines, allowedSources, maxPrepTime, bannedRecipes) {
+  const chosenCuisines = cuisines.length ? cuisines : CUISINES.map((c) => c.id);
+  const attempts = [
+    { cuisine: true, time: true, banned: true },
+    { cuisine: false, time: true, banned: true },
+    { cuisine: true, time: false, banned: true },
+    { cuisine: false, time: false, banned: true },
+    { cuisine: true, time: false, banned: false },
+    { cuisine: false, time: false, banned: false },
+  ];
+
+  for (const attempt of attempts) {
+    const pool = RECIPES.filter((r) => {
+      if (r.slot !== slotId) return false;
+      if (!matchesSources(r, allowedSources)) return false;
+      if (attempt.cuisine && !chosenCuisines.includes(r.cuisine)) return false;
+      if (attempt.time && !matchesTime(r, maxPrepTime)) return false;
+      if (attempt.banned && bannedRecipes.includes(r.id)) return false;
+      return true;
+    });
+    if (pool.length > 0) {
+      return {
+        pool,
+        droppedCuisine: !attempt.cuisine,
+        droppedTime: !attempt.time,
+        droppedBanned: !attempt.banned,
+      };
+    }
+  }
+  // absolute last resort: any recipe in this slot at all
+  return { pool: RECIPES.filter((r) => r.slot === slotId), droppedCuisine: true, droppedTime: true, droppedBanned: true };
+}
+
+function closestPick(pool, targetGrams, rand) {
+  if (pool.length === 0) return null;
+  if (pool.length === 1) return pool[0];
+  const weights = pool.map((r) => 1 / (1 + Math.abs(r.protein - targetGrams)));
+  const total = weights.reduce((a, b) => a + b, 0);
+  let roll = rand() * total;
+  for (let i = 0; i < pool.length; i++) {
+    roll -= weights[i];
+    if (roll <= 0) return pool[i];
+  }
+  return pool[pool.length - 1];
+}
+
+// Finds the single day's best combination of one recipe per slot by actually
+// searching combinations (bounded to a shortlist per slot so it stays cheap).
+// `usedThisWeek` tracks recipe ids already placed in each slot earlier in the
+// week — candidates already used are excluded first, so a slot's whole pool
+// gets cycled through before anything repeats, rather than the algorithm
+// converging on the same handful of highest-protein recipes every day.
+function buildDayCombo(slotPools, target, rand, usedThisWeek) {
+  const shortlists = {};
+  SLOTS.forEach((slot) => {
+    const pool = slotPools[slot.id];
+    const notYetUsed = pool.filter((r) => !usedThisWeek[slot.id].has(r.id));
+    const candidatePool = notYetUsed.length > 0 ? notYetUsed : pool; // whole pool cycled — start over
+    const sorted = [...candidatePool].sort((a, b) => b.protein - a.protein);
+    const top = sorted.slice(0, 5); // always consider the highest-protein options
+    const remaining = sorted.slice(5);
+    const extras = [];
+    for (let i = 0; i < 2 && remaining.length > 0; i++) {
+      const idx = Math.floor(rand() * remaining.length);
+      extras.push(remaining.splice(idx, 1)[0]);
+    }
+    shortlists[slot.id] = [...top, ...extras];
+  });
+
+  let bestDiff = Infinity;
+  let ties = [];
+  for (const rb of shortlists.breakfast) {
+    for (const rl of shortlists.lunch) {
+      for (const rd of shortlists.dinner) {
+        for (const rs of shortlists.snack) {
+          const sum = rb.protein + rl.protein + rd.protein + rs.protein;
+          const diff = Math.abs(sum - target);
+          if (diff < bestDiff - 0.001) {
+            bestDiff = diff;
+            ties = [{ breakfast: rb, lunch: rl, dinner: rd, snack: rs }];
+          } else if (Math.abs(diff - bestDiff) < 0.001) {
+            ties.push({ breakfast: rb, lunch: rl, dinner: rd, snack: rs });
+          }
+        }
+      }
+    }
+  }
+  return ties[Math.floor(rand() * ties.length)];
+}
+
+// Returns { plan, fallbackInfo, maxAchievable, minAchievable }. maxAchievable
+// is the highest daily total possible at all with the current filters (sum
+// of each slot's single highest-protein option) — if the target exceeds
+// this, no algorithm can close the gap and the app should say so plainly.
+function buildWeekPlan(cuisines, allowedSources, maxPrepTime, bannedRecipes, proteinTarget, weekSeed) {
+  const fallbackInfo = {};
+  const slotPools = {};
+
+  SLOTS.forEach((slot) => {
+    const { pool, droppedCuisine, droppedTime, droppedBanned } = getPoolForSlot(slot.id, cuisines, allowedSources, maxPrepTime, bannedRecipes);
+    if (droppedCuisine || droppedTime || droppedBanned) {
+      fallbackInfo[slot.id] = { droppedCuisine, droppedTime, droppedBanned };
+    }
+    slotPools[slot.id] = pool;
+  });
+
+  const usedThisWeek = {};
+  SLOTS.forEach((slot) => { usedThisWeek[slot.id] = new Set(); });
+
+  const plan = { breakfast: [], lunch: [], dinner: [], snack: [] };
+  for (let dayIdx = 0; dayIdx < 7; dayIdx++) {
+    const rand = seededRandom(`${weekSeed}-day${dayIdx}`);
+    const combo = buildDayCombo(slotPools, proteinTarget, rand, usedThisWeek);
+    SLOTS.forEach((slot) => {
+      plan[slot.id][dayIdx] = combo[slot.id];
+      usedThisWeek[slot.id].add(combo[slot.id].id);
+    });
+  }
+
+  const maxAchievable = SLOTS.reduce((sum, slot) => sum + Math.max(...slotPools[slot.id].map((r) => r.protein)), 0);
+  const minAchievable = SLOTS.reduce((sum, slot) => sum + Math.min(...slotPools[slot.id].map((r) => r.protein)), 0);
+
+  return { plan, fallbackInfo, maxAchievable, minAchievable };
+}
+
+// Scans a recipe's ingredients for components that assume something is
+// already prepared (cooked rice/beans, hard-boiled eggs, sofrito, etc.) and
+// returns plain-language heads-up notes so nothing is sprung on the cook
+// mid-recipe.
+function getPrepAheadNotes(recipe) {
+  const notes = [];
+  const add = (note) => { if (!notes.includes(note)) notes.push(note); };
+
+  recipe.ingredients.forEach((ing) => {
+    const t = ing.toLowerCase();
+    if (t.includes("cooked")) {
+      if (t.includes("rice")) add("Cook the rice ahead of time (about 18–20 min) — or use pre-cooked/microwave rice pouches to save time.");
+      else if (t.includes("lentil")) add("Cook the lentils ahead (about 20 min, no soaking needed) — or use pre-cooked lentils from a pouch or can.");
+      else if (t.includes("chickpea") || t.includes("garbanzo")) add("If using dried chickpeas, soak overnight and simmer 60–90 min ahead — canned chickpeas (drained and rinsed) skip this step entirely.");
+      else if (t.includes("bean") || t.includes("pea")) add("If using dried beans, soak overnight and simmer 45–60 min ahead — canned beans (drained and rinsed) skip this step entirely.");
+      else if (t.includes("chicken")) add("Cook and shred the chicken breast ahead (about 15–18 min poached or pan-cooked) — or use rotisserie chicken to save time.");
+      else if (t.includes("pasta")) add("Boil the pasta ahead per package directions (about 8–10 min) while you prep everything else.");
+    }
+    if (t.includes("hard-boiled") || t.includes("boiled egg")) add("Hard-boil the eggs ahead of time (about 10–12 min simmer, then cool in ice water before peeling).");
+    if (t.includes("boiled peanut")) add("Boiling peanuts from raw takes 1–3 hours — most grocers sell them pre-boiled (canned or refrigerated), which is the easier route.");
+    if (t.includes("roasted chickpea")) add("Roast the chickpeas ahead (400°F, 18–20 min) — or use store-bought roasted chickpeas.");
+    if (t.includes("sofrito")) add("Make sofrito ahead if you don't have store-bought — blend onion, peppers, garlic, cilantro, and culantro (about 10 min) — or grab a jar at a Latin grocer.");
+    if (t.includes("queso de fre")) add("Queso de freír (Puerto Rican frying cheese) is sold at Latin grocers — halloumi is the closest substitute if you can't find it.");
+  });
+
+  return notes;
+}
+
+function beep(freq = 880, duration = 0.18) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + duration + 0.05);
+  } catch (e) {
+    /* audio not available */
+  }
+}
+
+// crude macro split — our recipe data only tracks protein + calories, so we
+// back into a plausible carbs/fat split for Fitelations' 4-macro food log.
+const estimateMacros = (calories, protein) => {
+  const proteinCal = (protein || 0) * 4;
+  const remaining = Math.max(0, (calories || 0) - proteinCal);
+  return { carbs: Math.round((remaining * 0.55) / 4), fat: Math.round((remaining * 0.45) / 9) };
+};
+
+const MEALPLAN_KEY = "fc3_mealplan_settings";
+const MEALPLAN_OVERRIDES_KEY = "fc3_mealplan_overrides";
+const MEALPLAN_DEFAULTS = { proteinTarget: 180, calorieTarget: null, cuisines: [], proteinSources: ALL_SOURCE_IDS, maxPrepTime: null, bannedRecipes: [], reminders: { enabled: false, times: { breakfast: "08:00", lunch: "12:30", dinner: "18:30", snack: "15:30" } } };
+const loadMealPlanSettings = () => { try { return { ...MEALPLAN_DEFAULTS, ...JSON.parse(localStorage.getItem(MEALPLAN_KEY) || "{}") }; } catch { return MEALPLAN_DEFAULTS; } };
+const saveMealPlanSettings = cfg => { try { localStorage.setItem(MEALPLAN_KEY, JSON.stringify(cfg)); } catch {} };
+const loadMealPlanOverrides = seed => { try { const all = JSON.parse(localStorage.getItem(MEALPLAN_OVERRIDES_KEY) || "{}"); return all[seed] || {}; } catch { return {}; } };
+const saveMealPlanOverrides = (seed, val) => { try { const all = JSON.parse(localStorage.getItem(MEALPLAN_OVERRIDES_KEY) || "{}"); all[seed] = val; localStorage.setItem(MEALPLAN_OVERRIDES_KEY, JSON.stringify(all)); } catch {} };
+
+const MealChip = ({ active, onClick, children, color = C.accent }) => (
+  <button onClick={onClick} style={{
+    padding: "6px 12px", borderRadius: 99, border: `1px solid ${active ? color : C.border}`,
+    background: active ? color + "22" : C.surface, color: active ? color : C.muted,
+    fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+  }}>{children}</button>
+);
+
+// ── Setup form (first run, or reopened from Settings) ──────────────────────
+const MealPlanSetup = ({ settings, onSave, onCancel }) => {
+  const [local, setLocal] = useState(settings);
+  return (
+    <Card style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 15, fontWeight: 800, color: C.accent, marginBottom: 4 }}>Set up your meal plan</div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 16, lineHeight: 1.5 }}>Pick a protein target, the proteins you actually eat, and the kitchens you cook from. We'll build your week from there.</div>
+
+      <Inp label="Daily protein target (g)" type="number" value={local.proteinTarget} onChange={e => setLocal(p => ({ ...p, proteinTarget: +e.target.value || 0 }))} />
+      <Inp label="Daily calorie target (optional)" type="number" placeholder="No target set" value={local.calorieTarget || ""} onChange={e => setLocal(p => ({ ...p, calorieTarget: e.target.value ? +e.target.value : null }))} />
+
+      <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "14px 0 8px" }}>How much time do you have to cook?</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {TIME_PRESETS.map(t => (
+          <MealChip key={t.id} color={C.blue} active={local.maxPrepTime === t.value} onClick={() => setLocal(p => ({ ...p, maxPrepTime: t.value }))}>{t.label}</MealChip>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "14px 0 8px" }}>Proteins you eat</div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+        {PRESETS.map(p => (
+          <button key={p.id} onClick={() => setLocal(l => ({ ...l, proteinSources: p.sources }))} style={{
+            padding: "5px 10px", borderRadius: 8, border: "none", background: C.surface, color: C.text,
+            fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", textTransform: "uppercase", letterSpacing: 0.4,
+          }}>{p.label}</button>
+        ))}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {PROTEIN_SOURCES.map(src => (
+          <MealChip key={src.id} active={local.proteinSources.includes(src.id)} onClick={() => {
+            const has = local.proteinSources.includes(src.id);
+            setLocal(p => ({ ...p, proteinSources: has ? p.proteinSources.filter(s => s !== src.id) : [...p.proteinSources, src.id] }));
+          }}>{src.label}</MealChip>
+        ))}
+      </div>
+
+      <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "14px 0 8px" }}>Your kitchens</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16 }}>
+        {CUISINES.map(c => (
+          <MealChip key={c.id} color={C.purple} active={local.cuisines.includes(c.id)} onClick={() => {
+            const has = local.cuisines.includes(c.id);
+            setLocal(p => ({ ...p, cuisines: has ? p.cuisines.filter(x => x !== c.id) : [...p.cuisines, c.id] }));
+          }}>{c.label}</MealChip>
+        ))}
+      </div>
+      <div style={{ fontSize: 10, color: C.muted, marginBottom: 14 }}>Leave blank to pull from all kitchens.</div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        {onCancel && <Btn onClick={onCancel} variant="ghost" style={{ flex: 1 }}>Cancel</Btn>}
+        <Btn onClick={() => onSave(local)} style={{ flex: 1 }}>Build my week</Btn>
+      </div>
+    </Card>
+  );
+};
+
+// ── Recipe detail (ingredients / steps / prep-ahead) ────────────────────────
+const MealRecipeDetail = ({ recipe }) => {
+  const prepNotes = getPrepAheadNotes(recipe);
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px dashed ${C.border}` }}>
+      {prepNotes.length > 0 && (
+        <div style={{ background: C.yellowD, border: `1px solid ${C.yellow}44`, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.yellow, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>Prep ahead</div>
+          {prepNotes.map((n, i) => <div key={i} style={{ fontSize: 12, color: C.text, lineHeight: 1.5, marginBottom: 4 }}>• {n}</div>)}
+        </div>
+      )}
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>Ingredients</div>
+      {recipe.ingredients.map((ing, i) => <div key={i} style={{ fontSize: 12, color: C.text, lineHeight: 1.6 }}>— {ing}</div>)}
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "10px 0 6px" }}>Steps</div>
+      {recipe.steps.map((s, i) => <div key={i} style={{ fontSize: 12, color: C.text, lineHeight: 1.6, marginBottom: 3 }}>{i + 1}. {s}</div>)}
+    </div>
+  );
+};
+
+// ── One meal card (shared by Today + Week views) ────────────────────────────
+const MealCard = ({ slot, recipe, dateKey, dayIdx, logged, isOpen, onToggle, onLog, onShuffle, onQuick, onBan, compact }) => {
+  const prepNotes = getPrepAheadNotes(recipe);
+  return (
+    <Card style={{ marginBottom: compact ? 8 : 10, padding: compact ? "12px 14px" : 20 }}>
+      <div onClick={onToggle} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ flex: 1 }}>
+          <Tag color={C.orange}>{slot.label} · {slot.time}</Tag>
+          <div style={{ fontSize: compact ? 13 : 15, fontWeight: 700, color: C.text, marginTop: 6 }}>{recipe.name}</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{recipe.protein}g protein · {recipe.calories} cal · {recipe.time} · {CUISINES.find(c => c.id === recipe.cuisine)?.label}</div>
+          {!compact && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 8 }}>
+              {recipe.proteinSources.map(s => <Tag key={s} color={C.blue}>{PROTEIN_SOURCES.find(p => p.id === s)?.label}</Tag>)}
+              {prepNotes.length > 0 && <Tag color={C.yellow}>⏱ Needs prep ahead</Tag>}
+            </div>
+          )}
+        </div>
+        <span style={{ color: C.muted, fontSize: 13, marginLeft: 8 }}>{isOpen ? "▲" : "▼"}</span>
+      </div>
+      <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+        <Btn onClick={onLog} variant={logged ? "primary" : "ghost"} sm>{logged ? "✓ Logged" : "Log meal"}</Btn>
+        <Btn onClick={onQuick} variant="ghost" sm>⚡ &lt;15m</Btn>
+        <Btn onClick={onShuffle} variant="ghost" sm>🔀 Shuffle</Btn>
+        <Btn onClick={onBan} variant="ghost" sm>🚫</Btn>
+      </div>
+      {isOpen && <MealRecipeDetail recipe={recipe} />}
+    </Card>
+  );
+};
+
+// ── Week view ────────────────────────────────────────────────────────────────
+const MealWeekView = ({ weekDateKeys, recipeAt, isLogged, logMeal, shuffleMeal, quickMeal, banMeal, expanded, setExpanded, target }) => (
+  <div>
+    {DAYS.map((day, dayIdx) => {
+      const dateKey = weekDateKeys[dayIdx];
+      const dayTotal = SLOTS.reduce((sum, s) => { const r = recipeAt(s.id, dayIdx); return sum + (r ? r.protein : 0); }, 0);
+      return (
+        <div key={day} style={{ marginBottom: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.text }}>{day} <span style={{ fontSize: 10, color: C.muted, fontWeight: 400 }}>{dateKey.slice(5)}</span></div>
+            <div style={{ fontSize: 11, color: C.accent, fontFamily: "'Space Mono',monospace" }}>{dayTotal}g / {target}g</div>
+          </div>
+          {SLOTS.map(slot => {
+            const recipe = recipeAt(slot.id, dayIdx);
+            if (!recipe) return null;
+            const key = `${dateKey}-${slot.id}`;
+            return (
+              <MealCard
+                key={slot.id} slot={slot} recipe={recipe} compact
+                logged={isLogged(dateKey, slot.id, recipe.id)}
+                isOpen={expanded === key}
+                onToggle={() => setExpanded(expanded === key ? null : key)}
+                onLog={() => logMeal(dateKey, slot, recipe)}
+                onShuffle={() => shuffleMeal(slot.id, dayIdx, recipe)}
+                onQuick={() => quickMeal(slot.id, dayIdx, recipe)}
+                onBan={() => banMeal(slot.id, dayIdx, recipe)}
+              />
+            );
+          })}
+        </div>
+      );
+    })}
+  </div>
+);
+
+// ── Grocery list: aggregates ingredients across the whole week's planned menu ──
+const KNOWN_UNITS = ["cup", "cups", "tbsp", "tsp", "oz", "lb", "lbs", "g", "kg", "ml", "l", "clove", "cloves", "can", "cans", "slice", "slices", "pinch", "pinches", "block", "handful"];
+const UNIT_SINGULAR = { cups: "cup", lbs: "lb", cloves: "clove", cans: "can", slices: "slice", pinches: "pinch" };
+
+const parseQty = str => {
+  if (!str) return null;
+  str = str.trim();
+  if (!str) return null;
+  let total = 0, matched = false;
+  for (const part of str.split(" ")) {
+    if (/^\d+\/\d+$/.test(part)) { const [n, d] = part.split("/").map(Number); if (d) { total += n / d; matched = true; } }
+    else if (/^\d+(\.\d+)?$/.test(part)) { total += parseFloat(part); matched = true; }
+  }
+  return matched ? total : null;
+};
+
+const parseIngredientLine = raw => {
+  const m = raw.match(/^([\d./\s]+)?\s*([a-zA-Z]+)?\s*(.*)$/);
+  const qtyStr = m ? m[1] : null;
+  const maybeUnit = m ? (m[2] || "").toLowerCase() : "";
+  const isUnit = KNOWN_UNITS.includes(maybeUnit);
+  const qty = parseQty(qtyStr);
+  const unit = isUnit ? (UNIT_SINGULAR[maybeUnit] || maybeUnit) : null;
+  let item = isUnit ? (m[3] || "").trim() : raw.replace(qtyStr || "", "").trim();
+  if (!item) item = raw.trim();
+  return { qty, unit, item, raw };
+};
+
+const formatQty = n => {
+  const rounded = Math.round(n * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+};
+
+// Builds { grocery: [{key,label,qtyLines}], pantry: [{key,label}] } from every
+// recipe in the current week's plan (all 7 days × 4 slots, respecting shuffles/bans).
+const buildGroceryList = (weekDateKeys, recipeAt) => {
+  const seenRecipeIds = new Set();
+  const allIngredients = [];
+  SLOTS.forEach(slot => {
+    weekDateKeys.forEach((_, dayIdx) => {
+      const recipe = recipeAt(slot.id, dayIdx);
+      if (!recipe || seenRecipeIds.has(recipe.id + "-" + dayIdx + "-" + slot.id)) return;
+      seenRecipeIds.add(recipe.id + "-" + dayIdx + "-" + slot.id);
+      recipe.ingredients.forEach(ing => allIngredients.push(ing));
+    });
+  });
+
+  const groceryMap = {}; // key -> { label, units: { [unit|'count']: total } }
+  const pantrySet = new Set();
+
+  allIngredients.forEach(raw => {
+    const { qty, unit, item } = parseIngredientLine(raw);
+    if (qty === null) {
+      // No quantity parsed — likely a loose seasoning list like "Salt, pepper, hot sauce".
+      // Split on commas into individual pantry items rather than one messy line.
+      item.split(",").map(s => s.trim()).filter(Boolean).forEach(s => {
+        if (s.length < 40) pantrySet.add(s.replace(/\(optional\)/i, "").trim());
+      });
+      return;
+    }
+    const key = item.split(",")[0].trim().toLowerCase();
+    if (!key) return;
+    const label = item.split(",")[0].trim();
+    const unitKey = unit || "count";
+    if (!groceryMap[key]) groceryMap[key] = { label, units: {} };
+    groceryMap[key].units[unitKey] = (groceryMap[key].units[unitKey] || 0) + qty;
+  });
+
+  const grocery = Object.entries(groceryMap)
+    .map(([key, v]) => ({
+      key, label: v.label,
+      qtyLines: Object.entries(v.units).map(([unit, total]) => unit === "count" ? `${formatQty(total)}` : `${formatQty(total)} ${unit}${total !== 1 ? (unit.endsWith("s") ? "" : "s") : ""}`),
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  const pantry = [...pantrySet].sort((a, b) => a.localeCompare(b));
+
+  return { grocery, pantry };
+};
+
+const loadGroceryChecked = weekSeed => { try { const all = JSON.parse(localStorage.getItem("fc3_mealplan_grocery_checked") || "{}"); return all[weekSeed] || {}; } catch { return {}; } };
+const saveGroceryChecked = (weekSeed, val) => { try { const all = JSON.parse(localStorage.getItem("fc3_mealplan_grocery_checked") || "{}"); all[weekSeed] = val; localStorage.setItem("fc3_mealplan_grocery_checked", JSON.stringify(all)); } catch {} };
+
+const MealGroceryList = ({ weekDateKeys, recipeAt, weekSeed }) => {
+  const [checked, setChecked] = useState(() => loadGroceryChecked(weekSeed));
+  const [copied, setCopied] = useState(false);
+  useEffect(() => { setChecked(loadGroceryChecked(weekSeed)); }, [weekSeed]);
+
+  const { grocery, pantry } = buildGroceryList(weekDateKeys, recipeAt);
+
+  const toggle = key => {
+    const next = { ...checked, [key]: !checked[key] };
+    setChecked(next);
+    saveGroceryChecked(weekSeed, next);
+  };
+
+  const copyList = () => {
+    const lines = [
+      "Fresh & packaged:",
+      ...grocery.map(g => `- ${g.label} (${g.qtyLines.join(" + ")})`),
+      "", "Pantry & seasonings:",
+      ...pantry.map(p => `- ${p}`),
+    ];
+    try {
+      navigator.clipboard.writeText(lines.join("\n"));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {}
+  };
+
+  const Row = ({ itemKey, label, sub }) => (
+    <div onClick={() => toggle(itemKey)} style={{
+      display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.border}`, cursor: "pointer",
+    }}>
+      <div style={{
+        width: 20, height: 20, borderRadius: 6, border: `1.5px solid ${checked[itemKey] ? C.accent : C.border}`,
+        background: checked[itemKey] ? C.accent : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+      }}>{checked[itemKey] && <span style={{ color: "#000", fontSize: 12, fontWeight: 900 }}>✓</span>}</div>
+      <div style={{ flex: 1, opacity: checked[itemKey] ? 0.4 : 1 }}>
+        <span style={{ fontSize: 13, color: C.text, textDecoration: checked[itemKey] ? "line-through" : "none", textTransform: "capitalize" }}>{label}</span>
+        {sub && <span style={{ fontSize: 11, color: C.muted, marginLeft: 8, fontFamily: "'Space Mono',monospace" }}>{sub}</span>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+          Built from this week's full planned menu — 28 meals across 7 days. Quantities are combined where units match; loose seasonings are grouped separately below since they don't carry precise amounts.
+        </div>
+        <Btn onClick={copyList} variant="ghost" sm style={{ marginTop: 10 }}>{copied ? "✓ Copied" : "📋 Copy list"}</Btn>
+      </Card>
+
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: C.accent, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 }}>🥩 Fresh & Packaged ({grocery.length})</div>
+        {grocery.map(g => <Row key={g.key} itemKey={g.key} label={g.label} sub={g.qtyLines.join(" + ")} />)}
+      </Card>
+
+      <Card>
+        <div style={{ fontSize: 11, fontWeight: 700, color: C.yellow, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 }}>🧂 Pantry & Seasonings ({pantry.length})</div>
+        {pantry.map(p => <Row key={p} itemKey={"pantry:" + p} label={p} />)}
+      </Card>
+    </div>
+  );
+};
+
+// ── Settings overlay ─────────────────────────────────────────────────────────
+const MealSettingsModal = ({ settings, onSave, onClose }) => {
+  const [local, setLocal] = useState(settings);
+  const [permState, setPermState] = useState(() => (typeof Notification !== "undefined" ? Notification.permission : "unsupported"));
+  const width = useViewport();
+  const isMobile = bpOf(width) === "mobile";
+  const unban = id => setLocal(p => ({ ...p, bannedRecipes: p.bannedRecipes.filter(x => x !== id) }));
+
+  const toggleReminders = async () => {
+    const turningOn = !local.reminders.enabled;
+    if (turningOn) {
+      const granted = await requestNotifPermission();
+      setPermState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
+      if (!granted) return; // don't flip the toggle if permission was refused
+    }
+    setLocal(p => ({ ...p, reminders: { ...p.reminders, enabled: turningOn } }));
+  };
+  const updateTime = (slotId, val) => setLocal(p => ({ ...p, reminders: { ...p.reminders, times: { ...p.reminders.times, [slotId]: val } } }));
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 200, display: "flex", alignItems: isMobile ? "flex-end" : "center", justifyContent: "center", padding: isMobile ? 0 : 20 }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ background: C.card, borderRadius: isMobile ? "20px 20px 0 0" : 20, padding: 20, width: "100%", maxWidth: isMobile ? 480 : 520, maxHeight: "85vh", overflowY: "auto", border: isMobile ? "none" : `1px solid ${C.border}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: C.text }}>Meal plan settings</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: C.muted, fontSize: 20, cursor: "pointer" }}>×</button>
+        </div>
+
+        <Inp label="Daily protein target (g)" type="number" value={local.proteinTarget} onChange={e => setLocal(p => ({ ...p, proteinTarget: +e.target.value || 0 }))} />
+        <Inp label="Daily calorie target (optional)" type="number" placeholder="No target set" value={local.calorieTarget || ""} onChange={e => setLocal(p => ({ ...p, calorieTarget: e.target.value ? +e.target.value : null }))} />
+
+        <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "10px 0 8px" }}>Prep time</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          {TIME_PRESETS.map(t => <MealChip key={t.id} color={C.blue} active={local.maxPrepTime === t.value} onClick={() => setLocal(p => ({ ...p, maxPrepTime: t.value }))}>{t.label}</MealChip>)}
+        </div>
+
+        <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "10px 0 8px" }}>Proteins you eat</div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          {PRESETS.map(p => (
+            <button key={p.id} onClick={() => setLocal(l => ({ ...l, proteinSources: p.sources }))} style={{ padding: "5px 10px", borderRadius: 8, border: "none", background: C.surface, color: C.text, fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", textTransform: "uppercase", letterSpacing: 0.4 }}>{p.label}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          {PROTEIN_SOURCES.map(src => (
+            <MealChip key={src.id} active={local.proteinSources.includes(src.id)} onClick={() => {
+              const has = local.proteinSources.includes(src.id);
+              setLocal(p => ({ ...p, proteinSources: has ? p.proteinSources.filter(s => s !== src.id) : [...p.proteinSources, src.id] }));
+            }}>{src.label}</MealChip>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, margin: "10px 0 8px" }}>Your kitchens</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          {CUISINES.map(c => (
+            <MealChip key={c.id} color={C.purple} active={local.cuisines.includes(c.id)} onClick={() => {
+              const has = local.cuisines.includes(c.id);
+              setLocal(p => ({ ...p, cuisines: has ? p.cuisines.filter(x => x !== c.id) : [...p.cuisines, c.id] }));
+            }}>{c.label}</MealChip>
+          ))}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 16, paddingTop: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8 }}>Meal reminders</div>
+            <button onClick={toggleReminders} style={{
+              padding: "5px 12px", borderRadius: 99, border: `1px solid ${local.reminders.enabled ? C.accent : C.border}`,
+              background: local.reminders.enabled ? C.accentD : C.surface, color: local.reminders.enabled ? C.accent : C.muted,
+              fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+            }}>{local.reminders.enabled ? "🔔 On" : "🔕 Off"}</button>
+          </div>
+          {permState === "denied" && (
+            <div style={{ fontSize: 11, color: C.red, marginBottom: 8 }}>Notifications are blocked for this site in your browser — enable them in your phone/browser settings to use reminders.</div>
+          )}
+          <div style={{ fontSize: 10, color: C.muted, marginBottom: 10, lineHeight: 1.5 }}>
+            Real system notifications, sent while Fitelations is open or running in the background. They won't fire if the app has been fully closed for a long time — that needs a push server this app doesn't have (yet).
+          </div>
+          {SLOTS.map(slot => (
+            <div key={slot.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0" }}>
+              <span style={{ fontSize: 12, color: C.text }}>{slot.label}</span>
+              <input type="time" value={local.reminders.times[slot.id]} onChange={e => updateTime(slot.id, e.target.value)}
+                style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "5px 9px", color: C.text, fontSize: 12, fontFamily: "inherit" }} />
+            </div>
+          ))}
+        </div>
+
+        {local.bannedRecipes.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8 }}>Removed meals ({local.bannedRecipes.length})</div>
+            {local.bannedRecipes.map(id => {
+              const r = RECIPES.find(rec => rec.id === id);
+              if (!r) return null;
+              return (
+                <div key={id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
+                  <span style={{ fontSize: 12, color: C.text }}>{r.name}</span>
+                  <button onClick={() => unban(id)} style={{ background: "none", border: "none", color: C.accent, fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Add back</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
+          <Btn onClick={onClose} variant="ghost" style={{ flex: 1 }}>Cancel</Btn>
+          <Btn onClick={() => onSave(local)} style={{ flex: 1 }}>Save</Btn>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── Root Plan tab ─────────────────────────────────────────────────────────────
+const MealPlanTab = ({ foodLog, setFoodLog }) => {
+  const [settings, setSettingsState] = useState(loadMealPlanSettings);
+  const [needsSetup, setNeedsSetup] = useState(() => !localStorage.getItem(MEALPLAN_KEY));
+  const [view, setView] = useState("today");
+  const [showSettings, setShowSettings] = useState(false);
+  const [expanded, setExpanded] = useState(null);
+  const [overrides, setOverridesState] = useState({});
+
+  const updateSettings = next => { setSettingsState(next); saveMealPlanSettings(next); };
+
+  const weekSeed = `${isoWeekNumber()}-${settings.cuisines.slice().sort().join(",")}-${settings.proteinSources.slice().sort().join(",")}-${settings.maxPrepTime || "none"}`;
+
+  useEffect(() => { setOverridesState(loadMealPlanOverrides(weekSeed)); }, [weekSeed]);
+
+  const target = settings.proteinTarget || 180;
+  const { plan: weekPlan, fallbackInfo, maxAchievable } = buildWeekPlan(settings.cuisines, settings.proteinSources, settings.maxPrepTime, settings.bannedRecipes, target, weekSeed);
+  const weekDateKeys = getWeekDateKeys();
+  const todayIndex = new Date().getDay();
+  const todayDateKey = today();
+
+  const recipeAt = (slotId, dayIdx) => {
+    const ov = overrides[slotId] && overrides[slotId][dayIdx];
+    if (ov) { const found = RECIPES.find(r => r.id === ov); if (found) return found; }
+    return weekPlan[slotId][dayIdx];
+  };
+
+  // Check every 20s whether it's time for a meal reminder. Fires a real
+  // system notification (via the service worker) naming today's actual
+  // planned meal for that slot. Only runs while this screen/tab is mounted
+  // somewhere — see the note in MealSettingsModal for the honest limits.
+  const firedRef = useRef({});
+  useEffect(() => {
+    if (needsSetup || !settings.reminders || !settings.reminders.enabled) return;
+    const interval = setInterval(() => {
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const mm = String(now.getMinutes()).padStart(2, "0");
+      const nowStr = `${hh}:${mm}`;
+      const dayKey = today();
+      SLOTS.forEach(slot => {
+        const t = settings.reminders.times[slot.id];
+        const fireKey = `${dayKey}-${slot.id}`;
+        if (t === nowStr && !firedRef.current[fireKey]) {
+          firedRef.current[fireKey] = true;
+          const recipe = recipeAt(slot.id, new Date().getDay());
+          notify(`Time to eat — ${slot.label}`, recipe ? recipe.name : "Check your meal plan", "food");
+        }
+      });
+    }, 20000);
+    return () => clearInterval(interval);
+  }, [needsSetup, settings, overrides, weekSeed]);
+
+  if (needsSetup) {
+    return <MealPlanSetup settings={settings} onSave={s => { updateSettings(s); setNeedsSetup(false); }} />;
+  }
+
+  const isLogged = (dateKey, slotId, recipeId) => foodLog.some(e => e.date === dateKey && e.mealPlanRecipeId === recipeId && e.mealPlanSlot === slotId);
+
+  const logMeal = (dateKey, slot, recipe) => {
+    if (isLogged(dateKey, slot.id, recipe.id)) {
+      const nl = foodLog.filter(e => !(e.date === dateKey && e.mealPlanRecipeId === recipe.id && e.mealPlanSlot === slot.id));
+      setFoodLog(nl); save(KEYS.foodLog, nl);
+      return;
+    }
+    const { carbs, fat } = estimateMacros(recipe.calories, recipe.protein);
+    const entry = { id: Date.now() + Math.random(), date: dateKey, name: recipe.name, calories: recipe.calories, protein: recipe.protein, carbs, fat, mealPlanRecipeId: recipe.id, mealPlanSlot: slot.id };
+    const nl = [entry, ...foodLog];
+    setFoodLog(nl); save(KEYS.foodLog, nl);
+  };
+
+  const persistOverrides = next => { setOverridesState(next); saveMealPlanOverrides(weekSeed, next); };
+
+  const pickReplacement = (slotId, dayIdx, excludeId, bannedList, maxPrepOverride) => {
+    const cap = maxPrepOverride !== undefined ? maxPrepOverride : settings.maxPrepTime;
+    const { pool } = getPoolForSlot(slotId, settings.cuisines, settings.proteinSources, cap, bannedList);
+    const others = pool.filter(r => r.id !== excludeId);
+    if (!others.length) return null;
+    const otherTotal = SLOTS.filter(s => s.id !== slotId).reduce((sum, s) => { const r = recipeAt(s.id, dayIdx); return sum + (r ? r.protein : 0); }, 0);
+    return closestPick(others, target - otherTotal, Math.random);
+  };
+
+  const shuffleMeal = (slotId, dayIdx, current) => {
+    const rep = pickReplacement(slotId, dayIdx, current.id, settings.bannedRecipes);
+    if (!rep) return;
+    persistOverrides({ ...overrides, [slotId]: { ...(overrides[slotId] || {}), [dayIdx]: rep.id } });
+  };
+  const quickMeal = (slotId, dayIdx, current) => {
+    const rep = pickReplacement(slotId, dayIdx, current.id, settings.bannedRecipes, 15);
+    if (!rep) return;
+    persistOverrides({ ...overrides, [slotId]: { ...(overrides[slotId] || {}), [dayIdx]: rep.id } });
+  };
+  const banMeal = (slotId, dayIdx, current) => {
+    const nextBanned = [...new Set([...settings.bannedRecipes, current.id])];
+    updateSettings({ ...settings, bannedRecipes: nextBanned });
+    const dateKey = weekDateKeys[dayIdx];
+    if (isLogged(dateKey, slotId, current.id)) {
+      const nl = foodLog.filter(e => !(e.date === dateKey && e.mealPlanRecipeId === current.id && e.mealPlanSlot === slotId));
+      setFoodLog(nl); save(KEYS.foodLog, nl);
+    }
+    const rep = pickReplacement(slotId, dayIdx, current.id, nextBanned);
+    const next = { ...overrides };
+    if (rep) next[slotId] = { ...(next[slotId] || {}), [dayIdx]: rep.id };
+    else if (next[slotId]) delete next[slotId][dayIdx];
+    persistOverrides(next);
+  };
+
+  const plannedToday = SLOTS.reduce((sum, s) => { const r = recipeAt(s.id, todayIndex); return sum + (r ? r.protein : 0); }, 0);
+  const loggedToday = foodLog.filter(e => e.date === todayDateKey).reduce((a, e) => a + (e.protein || 0), 0);
+
+  return (
+    <div>
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 1 }}>This Week's Menu</div>
+          <button onClick={() => setShowSettings(true)} style={{ background: "none", border: "none", color: C.muted, fontSize: 16, cursor: "pointer" }}>⚙️</button>
+        </div>
+        <Bar value={loggedToday} max={target} color={C.blue} label="Protein logged today" sub={`${fmt(loggedToday)}/${target}g`} />
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+          Today's menu totals <strong style={{ color: C.accent, fontFamily: "'Space Mono',monospace" }}>{plannedToday}g</strong> across all 4 meals
+          {Math.abs(plannedToday - target) <= 10 ? " — right on target." : plannedToday < target ? ` — ${target - plannedToday}g short.` : ` — ${plannedToday - target}g over.`}
+        </div>
+        {target > maxAchievable && (
+          <div style={{ fontSize: 11, color: C.red, background: C.redD, borderRadius: 8, padding: "8px 10px", marginTop: 8 }}>
+            🚨 Your {target}g target isn't reachable with current filters — best possible day is ~{maxAchievable}g. Widen cuisines/proteins in settings.
+          </div>
+        )}
+      </Card>
+
+      <SubNav tabs={[{ id: "today", icon: "📆", label: "Today" }, { id: "week", icon: "🗓", label: "Week" }, { id: "list", icon: "🛒", label: "List" }]} active={view} onChange={setView} accent={C.orange} />
+
+      {Object.keys(fallbackInfo).length > 0 && (
+        <div style={{ fontSize: 11, color: C.yellow, background: C.yellowD, borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+          ⚠️ Some meals had to relax your filters to fill the day — check Settings if that's not what you want.
+        </div>
+      )}
+
+      {view === "today" && (
+        <div>
+          {SLOTS.map(slot => {
+            const recipe = recipeAt(slot.id, todayIndex);
+            if (!recipe) return null;
+            const key = slot.id + "-today";
+            return (
+              <MealCard
+                key={slot.id} slot={slot} recipe={recipe}
+                logged={isLogged(todayDateKey, slot.id, recipe.id)}
+                isOpen={expanded === key}
+                onToggle={() => setExpanded(expanded === key ? null : key)}
+                onLog={() => logMeal(todayDateKey, slot, recipe)}
+                onShuffle={() => shuffleMeal(slot.id, todayIndex, recipe)}
+                onQuick={() => quickMeal(slot.id, todayIndex, recipe)}
+                onBan={() => banMeal(slot.id, todayIndex, recipe)}
+              />
+            );
+          })}
+        </div>
+      )}
+      {view === "week" && (
+        <MealWeekView weekDateKeys={weekDateKeys} recipeAt={recipeAt} isLogged={isLogged} logMeal={logMeal} shuffleMeal={shuffleMeal} quickMeal={quickMeal} banMeal={banMeal} expanded={expanded} setExpanded={setExpanded} target={target} />
+      )}
+      {view === "list" && (
+        <MealGroceryList weekDateKeys={weekDateKeys} recipeAt={recipeAt} weekSeed={weekSeed} />
+      )}
+
+      {showSettings && <MealSettingsModal settings={settings} onSave={s => { updateSettings(s); setShowSettings(false); }} onClose={() => setShowSettings(false)} />}
+    </div>
+  );
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MERGED TAB: FOOD  (original Log tab + new Plan tab) — FoodTab itself is untouched
+// ══════════════════════════════════════════════════════════════════════════════
+const FoodMerged = (props) => {
+  const [sub, setSub] = useState("log");
+  const subTabs = [{ id: "log", icon: "🍽", label: "Log" }, { id: "plan", icon: "📅", label: "Plan" }];
+  return (
+    <div>
+      <SubNav tabs={subTabs} active={sub} onChange={setSub} />
+      {sub === "log" && <FoodTab profile={props.profile} foodLog={props.foodLog} setFoodLog={props.setFoodLog} savedMeals={props.savedMeals} setSavedMeals={props.setSavedMeals} discipline={props.discipline} />}
+      {sub === "plan" && <MealPlanTab foodLog={props.foodLog} setFoodLog={props.setFoodLog} />}
+    </div>
+  );
+};
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TUTORIAL SYSTEM
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2526,6 +3837,19 @@ export default function App() {
 
   const [appState,setAppState]=useState(()=>localStorage.getItem(TUTORIAL_KEY)?"app":"welcome");
 
+  // Tapping a reminder notification posts { type:"NAVIGATE_TAB", tab } from the
+  // service worker — jump straight to the relevant tab when that happens.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const handler = (event) => {
+      if (event.data && event.data.type === "NAVIGATE_TAB" && event.data.tab) {
+        setTab(event.data.tab);
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", handler);
+    return () => navigator.serviceWorker.removeEventListener("message", handler);
+  }, []);
+
   const finishTutorial=()=>{ localStorage.setItem(TUTORIAL_KEY,"1"); setAppState("app"); setTab("body"); };
   const skipTutorial=()=>{ localStorage.setItem(TUTORIAL_KEY,"1"); setAppState("app"); };
   const replayTutorial=()=>setAppState("tutorial");
@@ -2554,6 +3878,11 @@ export default function App() {
   const todayWater=hydration[today()]||0;
   const waterPct=Math.min(100,Math.round((todayWater/waterGoal)*100));
 
+  const width=useViewport();
+  const bp=bpOf(width);
+  const maxW=shellMaxWidth[bp];
+  const isDesktop=bp==="desktop";
+
   const tabs=[
     {id:"coach",icon:"⚡",label:"Coach"},
     {id:"food",icon:"🍽",label:"Food"},
@@ -2569,56 +3898,86 @@ export default function App() {
     discipline,onImport:handleImport,onReplayTutorial:replayTutorial
   };
 
+  const tabContent = (
+    <>
+      {tab==="coach"&&<CoachMerged {...sharedProps}/>}
+      {tab==="food"&&<FoodMerged profile={profile} foodLog={foodLog} setFoodLog={setFoodLog} savedMeals={savedMeals} setSavedMeals={setSavedMeals} discipline={discipline}/>}
+      {tab==="train"&&<TrainMerged {...sharedProps}/>}
+      {tab==="body"&&<BodyMerged {...sharedProps}/>}
+      {tab==="more"&&<SettingsMerged profile={profile} foodLog={foodLog} workouts={workouts} walks={walks} checkins={checkins} savedMeals={savedMeals} hydration={hydration} recovery={recovery} prs={prs} onImport={handleImport} onReplayTutorial={replayTutorial}/>}
+    </>
+  );
+
   return (
-    <div style={{background:C.bg,minHeight:"100vh",color:C.text,fontFamily:"'DM Sans','Segoe UI',sans-serif",maxWidth:480,margin:"0 auto",paddingBottom:80}}>
+    <div style={{background:C.bg,minHeight:"100vh",color:C.text,fontFamily:"'DM Sans','Segoe UI',sans-serif"}}>
       <GlobalStyle/>
       <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700;9..40,800;9..40,900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
 
       {appState==="welcome"&&<WelcomeScreen onTutorial={()=>setAppState("tutorial")} onSkip={skipTutorial}/>}
       {appState==="tutorial"&&<TutorialOverlay onFinish={finishTutorial} onSkip={skipTutorial} goToTab={setTab}/>}
 
-      {/* Header */}
-      <div style={{padding:"14px 16px 12px",position:"sticky",top:0,zIndex:100,background:`${C.bg}f0`,backdropFilter:"blur(20px)",borderBottom:"1px solid "+C.border}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <div>
-            <div style={{fontSize:20,fontWeight:900,color:discipline?C.red:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-0.5,transition:"color 0.3s"}}>FITELATIONS{discipline?" 🔴":""}</div>
-            <div style={{fontSize:9,color:C.muted,letterSpacing:1.5}}>{new Date().toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"}).toUpperCase()}</div>
+      <div style={{display:"flex",maxWidth:maxW,margin:"0 auto",alignItems:"flex-start"}}>
+        {isDesktop && (
+          <div style={{width:210,flexShrink:0,position:"sticky",top:0,height:"100vh",display:"flex",flexDirection:"column",padding:"20px 10px",borderRight:"1px solid "+C.border,boxSizing:"border-box"}}>
+            <div style={{fontSize:17,fontWeight:900,color:discipline?C.red:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-0.5,marginBottom:26,padding:"0 10px"}}>FITELATIONS{discipline?" 🔴":""}</div>
+            {tabs.map(t=>(
+              <button key={t.id} onClick={()=>setTab(t.id)} style={{
+                display:"flex",alignItems:"center",gap:11,padding:"11px 12px",borderRadius:10,border:"none",cursor:"pointer",
+                background:tab===t.id?(discipline?C.redD:C.accentD):"transparent",
+                color:tab===t.id?(discipline?C.red:C.accent):C.muted,fontFamily:"inherit",fontSize:13,fontWeight:700,
+                textAlign:"left",marginBottom:2,transition:"all 0.18s",
+              }}>
+                <span style={{fontSize:17}}>{t.icon}</span>{t.label}
+              </button>
+            ))}
+            <div style={{flex:1}}/>
+            <div style={{padding:"0 10px",fontSize:10,color:C.muted}}>{fmt(todayNet)}/{fmt(goal)} kcal net</div>
           </div>
-          <div style={{textAlign:"right"}}>
-            <div style={{fontSize:12,fontWeight:700,color:calPct>100?C.red:C.text}}>{fmt(todayNet)}/{fmt(goal)} kcal net</div>
-            <div style={{display:"flex",gap:4,marginTop:4,justifyContent:"flex-end"}}>
-              <div style={{width:70,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
-                <div style={{width:`${Math.min(100,calPct)}%`,height:"100%",background:calPct>100?C.red:C.accent,borderRadius:99,transition:"width 0.4s"}}/>
+        )}
+
+        <div style={{flex:1,minWidth:0}}>
+          {/* Header */}
+          <div style={{padding:isDesktop?"18px 24px 14px":"14px 16px 12px",position:"sticky",top:0,zIndex:100,background:`${C.bg}f0`,backdropFilter:"blur(20px)",borderBottom:"1px solid "+C.border}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <div>
+                {!isDesktop && <div style={{fontSize:20,fontWeight:900,color:discipline?C.red:C.accent,fontFamily:"'Space Mono',monospace",letterSpacing:-0.5,transition:"color 0.3s"}}>FITELATIONS{discipline?" 🔴":""}</div>}
+                <div style={{fontSize:9,color:C.muted,letterSpacing:1.5}}>{new Date().toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"}).toUpperCase()}</div>
               </div>
-              <div style={{width:40,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
-                <div style={{width:`${waterPct}%`,height:"100%",background:C.blue,borderRadius:99,transition:"width 0.4s"}}/>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:12,fontWeight:700,color:calPct>100?C.red:C.text}}>{fmt(todayNet)}/{fmt(goal)} kcal net</div>
+                <div style={{display:"flex",gap:4,marginTop:4,justifyContent:"flex-end"}}>
+                  <div style={{width:70,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
+                    <div style={{width:`${Math.min(100,calPct)}%`,height:"100%",background:calPct>100?C.red:C.accent,borderRadius:99,transition:"width 0.4s"}}/>
+                  </div>
+                  <div style={{width:40,height:4,background:C.border,borderRadius:99,overflow:"hidden"}}>
+                    <div style={{width:`${waterPct}%`,height:"100%",background:C.blue,borderRadius:99,transition:"width 0.4s"}}/>
+                  </div>
+                </div>
+                <div style={{fontSize:8,color:C.muted,marginTop:2}}>cal · water</div>
               </div>
             </div>
-            <div style={{fontSize:8,color:C.muted,marginTop:2}}>cal · water</div>
+            <DisciplineBanner active={discipline} onToggle={toggleDiscipline}/>
+          </div>
+
+          {/* Content */}
+          <div style={{padding:isDesktop?"18px 24px 24px":"12px 12px 0",paddingBottom:isDesktop?24:80}}>
+            {tabContent}
           </div>
         </div>
-        <DisciplineBanner active={discipline} onToggle={toggleDiscipline}/>
       </div>
 
-      {/* Content */}
-      <div style={{padding:"12px 12px 0"}}>
-        {tab==="coach"&&<CoachMerged {...sharedProps}/>}
-        {tab==="food"&&<FoodTab profile={profile} foodLog={foodLog} setFoodLog={setFoodLog} savedMeals={savedMeals} setSavedMeals={setSavedMeals} discipline={discipline}/>}
-        {tab==="train"&&<TrainMerged {...sharedProps}/>}
-        {tab==="body"&&<BodyMerged {...sharedProps}/>}
-        {tab==="more"&&<SettingsMerged profile={profile} foodLog={foodLog} workouts={workouts} walks={walks} checkins={checkins} savedMeals={savedMeals} hydration={hydration} recovery={recovery} prs={prs} onImport={handleImport} onReplayTutorial={replayTutorial}/>}
-      </div>
-
-      {/* Bottom Nav */}
-      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:`${C.surface}f8`,backdropFilter:"blur(20px)",borderTop:"1px solid "+C.border,display:"flex",padding:"6px 0 calc(6px + env(safe-area-inset-bottom))"}}>
-        {tabs.map(t=>(
-          <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"4px 0",transition:"all 0.2s",minWidth:0}}>
-            <span style={{fontSize:18,filter:tab===t.id?"none":"grayscale(1) opacity(0.35)"}}>{t.icon}</span>
-            <span style={{fontSize:9,fontWeight:700,color:tab===t.id?discipline?C.red:C.accent:C.muted,letterSpacing:0.4,textTransform:"uppercase",whiteSpace:"nowrap"}}>{t.label}</span>
-            {tab===t.id&&<div style={{width:16,height:2,background:discipline?C.red:C.accent,borderRadius:99}}/>}
-          </button>
-        ))}
-      </div>
+      {/* Bottom Nav — mobile & tablet only; desktop uses the sidebar above */}
+      {!isDesktop && (
+        <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:maxW,background:`${C.surface}f8`,backdropFilter:"blur(20px)",borderTop:"1px solid "+C.border,display:"flex",padding:"6px 0 calc(6px + env(safe-area-inset-bottom))"}}>
+          {tabs.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"4px 0",transition:"all 0.2s",minWidth:0}}>
+              <span style={{fontSize:18,filter:tab===t.id?"none":"grayscale(1) opacity(0.35)"}}>{t.icon}</span>
+              <span style={{fontSize:9,fontWeight:700,color:tab===t.id?discipline?C.red:C.accent:C.muted,letterSpacing:0.4,textTransform:"uppercase",whiteSpace:"nowrap"}}>{t.label}</span>
+              {tab===t.id&&<div style={{width:16,height:2,background:discipline?C.red:C.accent,borderRadius:99}}/>}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
